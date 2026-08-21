@@ -21,7 +21,8 @@ import httpx
 from PIL import Image
 from rich.text import Text
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.theme import Theme
 from textual.widgets import Static, Footer
 
 
@@ -31,24 +32,53 @@ def _run(cmd: list[str]) -> str:
     return subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True).strip()
 
 
+def _select_player() -> tuple[str, str]:
+    """Pick the most relevant MPRIS player when several are registered (e.g.
+    a browser leaves a stopped/idle MPRIS handle behind alongside a real
+    player). playerctl commands run without -p resolve each call against
+    whichever player it feels like, so status/position/metadata can end up
+    mixed from different players — prefer one that's actually playing."""
+    try:
+        players = _run(['playerctl', '-l']).splitlines()
+    except subprocess.CalledProcessError:
+        return '', 'Stopped'
+    statuses = {}
+    for p in players:
+        try:
+            statuses[p] = _run(['playerctl', '-p', p, 'status'])
+        except subprocess.CalledProcessError:
+            continue
+    for want in ('Playing', 'Paused'):
+        for p, s in statuses.items():
+            if s == want:
+                return p, s
+    if players:
+        return players[0], statuses.get(players[0], 'Stopped')
+    return '', 'Stopped'
+
+
 def get_track() -> dict:
     try:
-        status = _run(['playerctl', 'status'])
+        player, status = _select_player()
+        if not player:
+            return {'status': 'Stopped', 'title': '', 'artist': '', 'album': '',
+                    'art_url': '', 'position': 0.0, 'length': 0.0}
+        base = ['playerctl', '-p', player]
         result: dict = {'status': status}
         for key, field in [
             ('artist', 'artist'), ('title', 'title'),
             ('album', 'album'), ('art_url', 'mpris:artUrl'),
         ]:
             try:
-                result[key] = _run(['playerctl', 'metadata', field])
+                result[key] = _run(base + ['metadata', field])
             except subprocess.CalledProcessError:
                 result[key] = ''
         try:
-            result['position'] = float(_run(['playerctl', 'position']))
+            result['position'] = float(_run(base + ['position']))
         except (subprocess.CalledProcessError, ValueError):
             result['position'] = 0.0
         try:
-            result['length'] = int(_run(['playerctl', 'metadata', 'mpris:length'])) / 1e6
+            result['length'] = int(_run(base + ['metadata', 'mpris:length'])) / 1e6
         except (subprocess.CalledProcessError, ValueError):
             result['length'] = 0.0
         return result
@@ -59,11 +89,19 @@ def get_track() -> dict:
 
 # ─── album art ───────────────────────────────────────────────────────────────
 
-# Detect terminals that support the Kitty graphics protocol
-_KITTY_SUPPORT = os.environ.get('TERM_PROGRAM', '') in ('kitty', 'ghostty') or \
-                 os.environ.get('TERM', '') in ('xterm-kitty', 'xterm-ghostty')
+# Fast env-based hint for terminals known to support the Kitty graphics
+# protocol. This alone misses terminals like foot, which implement the
+# protocol without identifying themselves via TERM/TERM_PROGRAM, so it is
+# backed up by an active probe in _kitty_supported() below.
+_KITTY_ENV_HINT = os.environ.get('TERM_PROGRAM', '') in ('kitty', 'ghostty', 'WezTerm') or \
+                   os.environ.get('TERM', '') in ('xterm-kitty', 'xterm-ghostty') or \
+                   os.environ.get('TERM', '').startswith('foot') or \
+                   'KITTY_WINDOW_ID' in os.environ or \
+                   'GHOSTTY_RESOURCES_DIR' in os.environ or \
+                   'WEZTERM_EXECUTABLE' in os.environ
 
 _cell_size_cache: Optional[tuple[float, float]] = None
+_kitty_support_cache: Optional[bool] = None
 
 
 def _query_cell_size() -> tuple[float, float]:
@@ -100,6 +138,38 @@ def _get_cell_size() -> tuple[float, float]:
     return _cell_size_cache
 
 
+def _probe_kitty_support() -> bool:
+    """Actively query the terminal for Kitty graphics protocol support by
+    sending a 1x1 query action and checking for a reply. Only terminals that
+    implement the protocol respond, so this catches ones (e.g. foot) that
+    don't advertise support via TERM/TERM_PROGRAM."""
+    try:
+        fd = os.open('/dev/tty', os.O_RDWR)
+        old = termios.tcgetattr(fd)
+        tty.setraw(fd)
+        os.write(fd, b'\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\')
+        response = b''
+        for _ in range(64):
+            ready, _, _ = _select.select([fd], [], [], 0.3)
+            if not ready:
+                break
+            response += os.read(fd, 1)
+            if response.endswith(b'\x1b\\'):
+                break
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        os.close(fd)
+        return b'_Gi=31;' in response
+    except Exception:
+        return False
+
+
+def _kitty_supported() -> bool:
+    global _kitty_support_cache
+    if _kitty_support_cache is None:
+        _kitty_support_cache = _KITTY_ENV_HINT or _probe_kitty_support()
+    return _kitty_support_cache
+
+
 def _kitty_encode(img: Image.Image, cols: int, rows: int) -> bytes:
     """Encode image as Kitty graphics protocol escape sequences."""
     img = img.convert('RGB')
@@ -133,18 +203,50 @@ def _halfblock(img: Image.Image, w: int, h: int) -> Text:
     return t
 
 
-async def fetch_art_bytes(url: str) -> Optional[bytes]:
-    if not url:
+async def _fetch_art_from_web(artist: str, title: str, album: str) -> Optional[bytes]:
+    """Fallback when the player doesn't expose a usable mpris:artUrl: look up
+    high-resolution cover art via the (keyless) iTunes Search API."""
+    query = ' '.join(p for p in (artist, album or title) if p).strip()
+    if not query:
         return None
     try:
-        if url.startswith('file://'):
-            return Path(url[7:]).read_bytes()
         async with httpx.AsyncClient() as c:
-            r = await c.get(url, timeout=5.0, follow_redirects=True)
+            r = await c.get(
+                'https://itunes.apple.com/search',
+                params={'term': query, 'media': 'music', 'limit': 1},
+                timeout=5.0,
+            )
             r.raise_for_status()
-            return r.content
+            results = r.json().get('results', [])
+            if not results:
+                return None
+            art_url = results[0].get('artworkUrl100', '')
+            if not art_url:
+                return None
+            art_url = re.sub(r'/\d+x\d+bb\.', '/1200x1200bb.', art_url)
+            r2 = await c.get(art_url, timeout=5.0)
+            r2.raise_for_status()
+            return r2.content
     except Exception:
         return None
+
+
+async def fetch_art_bytes(url: str, artist: str = '', title: str = '', album: str = '') -> Optional[bytes]:
+    if url:
+        try:
+            if url.startswith('file://'):
+                data = Path(url[7:]).read_bytes()
+                if data:
+                    return data
+            else:
+                async with httpx.AsyncClient() as c:
+                    r = await c.get(url, timeout=5.0, follow_redirects=True)
+                    r.raise_for_status()
+                    if r.content:
+                        return r.content
+        except Exception:
+            pass
+    return await _fetch_art_from_web(artist, title, album)
 
 
 # ─── lyrics ──────────────────────────────────────────────────────────────────
@@ -173,6 +275,49 @@ async def fetch_lyrics_data(artist: str, title: str, album: str = '') -> dict:
     except Exception:
         pass
     return {}
+
+
+# ─── trivia ──────────────────────────────────────────────────────────────────
+
+async def _wiki_extract(query: str) -> str:
+    """Fetch the intro extract of the best-matching Wikipedia article."""
+    if not query:
+        return ''
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                'https://en.wikipedia.org/w/api.php',
+                params={
+                    'action': 'query',
+                    'generator': 'search',
+                    'gsrsearch': query,
+                    'gsrlimit': 1,
+                    'prop': 'extracts',
+                    'exintro': 1,
+                    'explaintext': 1,
+                    'format': 'json',
+                },
+                timeout=8.0,
+                headers={'User-Agent': 'legendary-lyrics/1.0'},
+            )
+            r.raise_for_status()
+            pages = r.json().get('query', {}).get('pages', {})
+            for page in pages.values():
+                extract = page.get('extract', '').strip()
+                if extract:
+                    return extract
+    except Exception:
+        pass
+    return ''
+
+
+async def fetch_trivia(artist: str, album: str) -> tuple[str, str]:
+    """Fetch background info about the album and the artist from Wikipedia."""
+    album_query = f'{album} {artist} album' if album and artist else ''
+    album_text, artist_text = await asyncio.gather(
+        _wiki_extract(album_query), _wiki_extract(artist),
+    )
+    return album_text, artist_text
 
 
 # ─── audio visualizer ────────────────────────────────────────────────────────
@@ -263,6 +408,55 @@ class Visualizer:
             self._cfg_path.unlink()
 
 
+# ─── OS theme ─────────────────────────────────────────────────────────────────
+
+# Stable path the Omarchy desktop keeps pointed at the active theme's colors,
+# updated in place whenever the user switches theme.
+_OMARCHY_COLORS_PATH = Path.home() / '.local/state/omarchy/current/theme/colors.toml'
+
+
+def _parse_flat_toml(text: str) -> dict[str, str]:
+    """Parse the flat `key = "value"` pairs in Omarchy's colors.toml. Avoids
+    a TOML dependency since the file has no sections, arrays, or nesting."""
+    out = {}
+    for line in text.splitlines():
+        m = re.match(r'^\s*(\w+)\s*=\s*"([^"]*)"', line)
+        if m:
+            out[m.group(1)] = m.group(2)
+    return out
+
+
+def _hex_luminance(hex_color: str) -> float:
+    hex_color = hex_color.lstrip('#')
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
+
+def _load_os_theme() -> Optional[Theme]:
+    """Build a Textual theme from the user's active Omarchy desktop theme, so
+    the app's colors follow the OS theme instead of Textual's built-in one."""
+    try:
+        colors = _parse_flat_toml(_OMARCHY_COLORS_PATH.read_text())
+        background = colors.get('background')
+        foreground = colors.get('foreground')
+        accent = colors.get('accent') or colors.get('color4')
+        if not (background and foreground and accent):
+            return None
+        return Theme(
+            name='omarchy',
+            primary=accent,
+            accent=colors.get('color5', accent),
+            background=background,
+            foreground=foreground,
+            error=colors.get('color1', accent),
+            warning=colors.get('color3', accent),
+            success=colors.get('color2', accent),
+            dark=_hex_luminance(background) < 128,
+        )
+    except Exception:
+        return None
+
+
 # ─── widgets ─────────────────────────────────────────────────────────────────
 
 _EIGHTH_BLOCKS = ' ▁▂▃▄▅▆▇█'
@@ -271,8 +465,8 @@ _EIGHTH_BLOCKS = ' ▁▂▃▄▅▆▇█'
 class VizWidget(Static):
     DEFAULT_CSS = """
     VizWidget {
-        width: 30;
-        height: 1fr;
+        width: 1fr;
+        height: 7;
         border: round $accent;
         padding: 0;
         overflow: hidden hidden;
@@ -281,10 +475,15 @@ class VizWidget(Static):
 
     def render_bars(self, heights: list[float]):
         rows = self.content_size.height
-        if rows <= 0:
+        cols = self.content_size.width
+        n = len(heights)
+        if rows <= 0 or cols <= 0 or n == 0:
             return
         text = Text(no_wrap=True)
         h_eighths = [int(h * rows * 8) for h in heights]
+        # Nearest-neighbour stretch of the n bar values across the full
+        # widget width, so the strip fills its row regardless of bar count.
+        col_bar = [i * n // cols for i in range(cols)]
 
         for row in range(rows):
             rfb = rows - 1 - row
@@ -297,8 +496,8 @@ class VizWidget(Static):
             else:
                 color = 'bright_red'
 
-            for he in h_eighths:
-                e = he - rfb * 8
+            for bar_i in col_bar:
+                e = h_eighths[bar_i] - rfb * 8
                 if e >= 8:
                     text.append('█', style=color)
                 elif e > 0:
@@ -312,8 +511,8 @@ class VizWidget(Static):
 class ArtWidget(Static):
     DEFAULT_CSS = """
     ArtWidget {
-        width: 40%;
-        height: 1fr;
+        width: 1fr;
+        height: auto;
         border: round $accent;
         padding: 0;
         overflow: hidden hidden;
@@ -323,17 +522,48 @@ class ArtWidget(Static):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._img_data: Optional[bytes] = None
+        self._img_aspect: Optional[float] = None
         self._last_size: tuple[int, int] = (0, 0)
         self._resize_timer = None
 
     def set_image_data(self, data: Optional[bytes]):
         self._img_data = data
         self._last_size = (0, 0)
-        if _KITTY_SUPPORT:
+        self._img_aspect = None
+        if data:
+            try:
+                img = Image.open(io.BytesIO(data))
+                w, h = img.size
+                self._img_aspect = w / h
+            except Exception:
+                pass
+        self._fit_height_to_image()
+        if _kitty_supported():
             self.update(Text(''))
             self.call_after_refresh(self._paint_kitty)
         else:
             self.call_later(self._paint_halfblock)
+
+    def _fit_height_to_image(self) -> None:
+        """Size the widget's height to the image's aspect ratio at its
+        current width, so the border hugs the artwork instead of leaving
+        letterboxed black bars around it. Capped to a share of the column
+        so the trivia panel below always keeps some room."""
+        if not self._img_aspect:
+            return
+        content_width = self.content_size.width
+        if content_width <= 0:
+            return
+        cell_w, cell_h = _get_cell_size()
+        rows_per_cell = cell_h if _kitty_supported() else cell_h / 2
+        disp_rows = max(1, round(content_width * cell_w / self._img_aspect / rows_per_cell))
+
+        parent = self.parent
+        if parent is not None and parent.size.height > 0:
+            max_total = int(parent.size.height * 0.7)
+            disp_rows = min(disp_rows, max(1, max_total - 2))
+
+        self.styles.height = disp_rows + 2  # + top/bottom border
 
     def on_resize(self) -> None:
         # Debounce: cancel previous timer and restart, so we paint only after
@@ -346,8 +576,9 @@ class ArtWidget(Static):
 
     def _on_resize_settled(self) -> None:
         self._resize_timer = None
+        self._fit_height_to_image()
         self._last_size = (0, 0)   # force repaint at new dimensions
-        if _KITTY_SUPPORT:
+        if _kitty_supported():
             self._paint_kitty()
         else:
             self._paint_halfblock()
@@ -441,6 +672,37 @@ class ArtWidget(Static):
             pass
 
 
+class TriviaWidget(VerticalScroll):
+    DEFAULT_CSS = """
+    TriviaWidget {
+        width: 1fr;
+        height: 1fr;
+        border: round $accent;
+        padding: 0 1;
+    }
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._content = Static('')
+
+    def compose(self) -> ComposeResult:
+        yield self._content
+
+    def set_trivia(self, album: str, artist: str, album_text: str, artist_text: str):
+        text = Text()
+        if album_text:
+            text.append(f'{album}\n', style='bold bright_cyan')
+            text.append(f'{album_text}\n\n')
+        if artist_text:
+            text.append(f'{artist}\n', style='bold bright_cyan')
+            text.append(f'{artist_text}\n')
+        if not text.plain:
+            text.append('No trivia found', style='dim italic')
+        self._content.update(text)
+        self.scroll_home(animate=False)
+
+
 class LyricsWidget(Static):
     DEFAULT_CSS = """
     LyricsWidget {
@@ -510,7 +772,8 @@ class LegendaryLyricsApp(App):
         border-bottom: solid $accent;
         text-style: bold;
     }
-    #body { height: 1fr; }
+    #columns { height: 1fr; }
+    #left-col { width: 40%; height: 1fr; }
     #progress {
         height: 1;
         background: $panel;
@@ -527,18 +790,24 @@ class LegendaryLyricsApp(App):
         self._track: dict = {}
         self._lrc: list[tuple[float, str]] = []
         self._plain: list[str] = []
-        self._viz = Visualizer(n_bars=26)
+        self._viz = Visualizer(n_bars=60)
 
     def compose(self) -> ComposeResult:
         yield Static('Legendary Lyrics', id='info')
-        with Horizontal(id='body'):
-            yield ArtWidget(id='art')
+        with Horizontal(id='columns'):
+            with Vertical(id='left-col'):
+                yield ArtWidget(id='art')
+                yield TriviaWidget(id='trivia')
             yield LyricsWidget(id='lyrics')
-            yield VizWidget(id='viz')
+        yield VizWidget(id='viz')
         yield Static('', id='progress')
         yield Footer()
 
     async def on_mount(self):
+        os_theme = _load_os_theme()
+        if os_theme:
+            self.register_theme(os_theme)
+            self.theme = 'omarchy'
         await self._viz.start()
         self.set_interval(1.0, self._poll)
         self.set_interval(0.5, self._sync_lrc)
@@ -567,16 +836,28 @@ class LegendaryLyricsApp(App):
             self._lrc = []
             self._plain = []
             self.query_one('#lyrics', LyricsWidget).set_lyrics([])
+            self.query_one('#trivia', TriviaWidget).set_trivia('', '', '', '')
 
-            art_task = asyncio.create_task(fetch_art_bytes(track.get('art_url', '')))
+            art_task = asyncio.create_task(fetch_art_bytes(
+                track.get('art_url', ''), track.get('artist', ''),
+                track.get('title', ''), track.get('album', ''),
+            ))
             lyrics_task = asyncio.create_task(
                 fetch_lyrics_data(
                     track.get('artist', ''), track.get('title', ''), track.get('album', '')
                 )
             )
-            art_data, lyrics_data = await asyncio.gather(art_task, lyrics_task)
+            trivia_task = asyncio.create_task(
+                fetch_trivia(track.get('artist', ''), track.get('album', ''))
+            )
+            art_data, lyrics_data, (album_text, artist_text) = await asyncio.gather(
+                art_task, lyrics_task, trivia_task
+            )
 
             self.query_one('#art', ArtWidget).set_image_data(art_data)
+            self.query_one('#trivia', TriviaWidget).set_trivia(
+                track.get('album', ''), track.get('artist', ''), album_text, artist_text
+            )
 
             synced = lyrics_data.get('syncedLyrics', '')
             plain = lyrics_data.get('plainLyrics', '')
@@ -634,4 +915,9 @@ class LegendaryLyricsApp(App):
 
 
 if __name__ == '__main__':
+    # Probe terminal capabilities before Textual takes over stdin: once the
+    # app is running, its input loop competes with our raw tty reads for
+    # escape-sequence responses, so queries done after start-up are unreliable.
+    _kitty_supported()
+    _get_cell_size()
     LegendaryLyricsApp().run()
