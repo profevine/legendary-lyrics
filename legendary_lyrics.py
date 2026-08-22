@@ -354,6 +354,24 @@ def _kitty_supported() -> bool:
     return _kitty_support_cache
 
 
+# Transmitting with a=T creates a *new placement* every time, and placements
+# persist until deleted — so repainting without deleting leaves the previous
+# copy pinned where it was, on top of whatever now occupies those cells.
+# Everything we draw carries this id so the delete can target only our image
+# and leave alone anything other programs left in the terminal.
+_KITTY_IMAGE_ID = 1971
+_KITTY_DELETE = b'\x1b_Ga=d,d=I,i=%d\x1b\\' % _KITTY_IMAGE_ID
+
+
+def _kitty_delete() -> None:
+    """Remove our image and every placement of it."""
+    try:
+        with open('/dev/tty', 'wb') as tty_f:
+            tty_f.write(_KITTY_DELETE)
+    except Exception:
+        pass
+
+
 def _kitty_encode(img: Image.Image, cols: int, rows: int) -> bytes:
     """Encode image as Kitty graphics protocol escape sequences."""
     img = img.convert('RGB')
@@ -366,7 +384,8 @@ def _kitty_encode(img: Image.Image, cols: int, rows: int) -> bytes:
     for i, chunk in enumerate(chunks):
         more = 0 if i == len(chunks) - 1 else 1
         if i == 0:
-            hdr = f'a=T,f=24,s={w},v={h},c={cols},r={rows},m={more}'
+            hdr = (f'a=T,f=24,s={w},v={h},c={cols},r={rows},'
+                   f'i={_KITTY_IMAGE_ID},m={more}')
         else:
             hdr = f'm={more}'
         out.append(b'\x1b_G' + hdr.encode() + b';' + chunk + b'\x1b\\')
@@ -868,15 +887,12 @@ class ArtWidget(Static):
         self.styles.height = disp_rows + 2  # + top/bottom border
 
     def hide_kitty(self) -> None:
-        """Erase the Kitty image. Its pixels live outside the cell grid, so a
-        modal drawn over this area would otherwise show the art through it."""
+        """Erase the Kitty image. Its pixels live outside the cell grid, so
+        anything drawn over this area — a modal, or the app's own widgets
+        after a resize — would otherwise have the art showing through."""
         if not (_kitty_supported() and self._img_data):
             return
-        try:
-            with open('/dev/tty', 'wb') as tty_f:
-                tty_f.write(b'\x1b_Ga=d\x1b\\')
-        except Exception:
-            pass
+        _kitty_delete()
         self._last_size = (0, 0)   # force a repaint when it comes back
 
     def repaint(self) -> None:
@@ -886,6 +902,10 @@ class ArtWidget(Static):
             self._paint_halfblock()
 
     def on_resize(self) -> None:
+        # Take the image down for the duration of the drag. The new layout is
+        # drawn immediately while the repaint below is debounced, so leaving
+        # it up would park the old art over freshly moved widgets.
+        self.hide_kitty()
         # Debounce: cancel previous timer and restart, so we paint only after
         # the terminal finishes resizing (avoids mid-resize garbage frames).
         if self._resize_timer is not None:
@@ -948,7 +968,8 @@ class ArtWidget(Static):
             cursor = f'\x1b[{off_y + 1};{off_x + 1}H'.encode()
 
             with open('/dev/tty', 'wb') as tty_f:
-                tty_f.write(b'\x1b7' + cursor + kitty_seq + b'\x1b8')
+                tty_f.write(_KITTY_DELETE
+                            + b'\x1b7' + cursor + kitty_seq + b'\x1b8')
         except Exception:
             pass
 
@@ -1354,6 +1375,9 @@ class LegendaryLyricsApp(App):
 
     async def on_unmount(self):
         await self._viz.stop()
+        if _kitty_supported():
+            # Otherwise the album art stays on the terminal after we exit.
+            _kitty_delete()
 
     async def action_quit(self):
         self.exit()
