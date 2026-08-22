@@ -1,6 +1,8 @@
 # Legendary Lyrics
 
-Terminal music visualizer with album art, synced lyrics, Wikipedia trivia and bar animation — with playback controls, so you never leave the terminal to skip a track.
+A terminal music visualizer: album art, lyrics that follow the song, Wikipedia
+background on what you're hearing, and playback controls — for whatever is
+already playing on your machine.
 
 ```
 ┌───────────────────────────────────────────────────────────────────────┐
@@ -27,21 +29,20 @@ Terminal music visualizer with album art, synced lyrics, Wikipedia trivia and ba
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
-**Features:**
+**What it does**
 
-- **Album art** — rendered with the Kitty graphics protocol on terminals that support it (detected by an active probe, not a hardcoded list, so `foot` and friends get full resolution too), falling back to high-resolution ANSI half-block art everywhere else. The panel is sized to the artwork's real aspect ratio and re-renders on terminal resize.
-- **Lyrics** from [lrclib.net](https://lrclib.net) — synced line-by-line with the current line highlighted, plain text when no LRC exists. The version whose duration matches the track is preferred, so a single edit or remaster doesn't leave synced lyrics drifting out of time.
-- **Playback controls** — play / pause, skip, and seek without leaving the app.
-- **Player picker** — click the title bar (or press `s`) to choose which player to follow, with each one's current track shown so you can tell a browser tab from your music player.
-- **Trivia panel** — Wikipedia background on the current album and artist, scrollable, below the art.
-- **Bar visualizer** — a full-width strip driven by `cava` when installed, or a built-in simulation otherwise. The panel's border names which of the two is running, and the bars settle flat while playback is paused.
-- **Live playback sync** — progress bar, elapsed / total time and play / pause / stop icon, read from the player that is actually playing when several MPRIS players are registered.
-- **Desktop theme aware** — follows the active [Omarchy](https://omarchy.org) theme's colors, falling back to Textual's palette elsewhere.
-- **Cached** — lyrics, art and trivia are stored under `~/.cache/legendary-lyrics`, so a track you've already played comes back instantly and works offline.
+- **Album art** at full resolution on terminals that speak the Kitty graphics protocol, ANSI half-blocks everywhere else — sized to the artwork's real aspect ratio, redrawn on resize.
+- **Lyrics** from lrclib.net, synced line-by-line, matched by duration so they don't drift out of time on a remaster or single edit.
+- **Playback controls** — play/pause, skip and seek, without leaving the terminal.
+- **A player picker** — click the title bar to choose which of your running players to follow.
+- **Trivia** on the album and artist from Wikipedia, in your language.
+- **A bar visualizer** fed by `cava`, which says so on its border when it's real.
+- **Cached** locally, so a track you've heard before loads instantly and offline.
+- **Follows your Omarchy desktop theme.**
 
 ---
 
-## Installation
+## Install
 
 ### Arch Linux (AUR)
 
@@ -51,7 +52,7 @@ yay -S legendary-lyrics    # or: paru -S legendary-lyrics
 
 Then run `legendary-lyrics` from anywhere.
 
-Install the optional dependency `cava` for real audio bars:
+`cava` is an optional dependency — install it for real audio bars:
 
 ```bash
 sudo pacman -S cava
@@ -59,7 +60,9 @@ sudo pacman -S cava
 
 ### From source (any distro)
 
-Install the system dependencies first:
+`playerctl` is required. It's how the app sees your music: any player that
+speaks MPRIS (Spotify, Firefox, Chromium, VLC, Rhythmbox, MPD with a plugin…)
+is picked up automatically.
 
 ```bash
 # Arch Linux / Manjaro
@@ -72,86 +75,221 @@ sudo apt install playerctl python3 python3-venv
 sudo dnf install playerctl python3
 ```
 
-`playerctl` is required — it reads track info from any media player that speaks MPRIS (Spotify, Firefox, Rhythmbox, MPD with plugin, VLC, etc.).
-
-Then set up the project:
+Then:
 
 ```bash
 git clone https://github.com/profevine/legendary-lyrics
 cd legendary-lyrics
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+./run.sh
 ```
 
-No further configuration needed.
+`run.sh` uses that virtualenv when it exists and falls back to your system
+Python otherwise — so if `textual`, `httpx` and `pillow` already come from your
+distro's packages, you can skip the virtualenv entirely and just run `./run.sh`.
 
 ---
 
-## Usage
+## Using it
+
+Start some music, then start the app. There's nothing to configure: it finds
+the player, fetches the artwork, the lyrics and the trivia, and starts drawing.
 
 ```bash
-# Installed from the AUR
 legendary-lyrics
-
-# From a source checkout
-./run.sh
-
-# Or directly with the venv python
-.venv/bin/python3 legendary_lyrics.py
 ```
 
-### Keyboard shortcuts
+### Controlling playback
 
-| Key     | Action                                          |
-|---------|-------------------------------------------------|
-| `space` | Play / pause                                    |
-| `n`     | Next track                                      |
-| `p`     | Previous track                                  |
-| `→` `←` | Seek forward / back 5 seconds                   |
-| `s`     | Choose which player to follow                    |
-| `r`     | Refetch this track's lyrics, art and trivia     |
-| `q`     | Quit                                            |
+You don't need to switch back to your music player.
 
-Controls are sent to whichever player is being followed; a player that doesn't implement one (browsers often lack seeking) simply ignores it. `r` drops the track's cache entries before refetching, so it's the way out of a bad lyrics match.
+| Key     | Action                        |
+|---------|-------------------------------|
+| `space` | Play / pause                  |
+| `n`     | Next track                    |
+| `p`     | Previous track                |
+| `→` `←` | Seek forward / back 5 seconds |
 
-The trivia panel scrolls with the mouse wheel, or with `↑` `↓` / `PgUp` / `PgDn`.
+Commands go to the player being followed. One that doesn't implement a control
+just ignores it — browsers commonly refuse seeking.
 
-### Command-line options
+> The footer doesn't list the seek keys while the trivia panel has focus,
+> because that panel binds the arrow keys for its own scrolling. Seeking still
+> works; it's only the label that's missing.
 
-| Option              | Effect                                                              |
-|---------------------|---------------------------------------------------------------------|
-| `-p`, `--player`    | Follow a specific player instead of auto-selecting (`--player spotify`) |
-| `-b`, `--bars N`    | Visualizer bar count (default 60)                                   |
-| `--lang CODE`       | Wikipedia edition for trivia, falling back to English (default: your locale) |
-| `--no-trivia`       | Hide the trivia panel; the album art takes the whole column          |
-| `--no-cache`        | Never read or write the on-disk cache                               |
-| `--clear-cache`     | Delete everything cached, then exit                                 |
-| `--list-players`    | Print the registered MPRIS players, then exit                       |
-| `-V`, `--version`   | Print the version                                                   |
+### Choosing which player to follow
 
-### Tips
+The end of the title bar shows who's being followed:
 
-- **Resize the terminal** — art, lyrics and bars all re-render at the new size.
-- **Blocky album art?** — the terminal doesn't implement the Kitty graphics protocol, so the half-block renderer is used. Kitty, Ghostty, foot and WezTerm all support it.
-- **No album art at all?** — if the player exposes no usable `mpris:artUrl`, the cover is looked up on the iTunes Search API instead. A track that matches nothing there shows an empty panel.
-- **No lyrics shown?** — the track may not be in lrclib.net's database. An exact lookup is tried first, then a fuzzy search ranked by how closely each version's duration matches what's playing.
-- **Lyrics out of sync?** — press `r`. That forgets the cached match and refetches, usually landing on a version with the right duration.
-- **Wrong track detected?** — make sure the media player exposes MPRIS. Run `legendary-lyrics --list-players` to see what's registered.
-- **Multiple players** — the one that's actually playing wins, and a real music track outranks a browser tab left on a video. To override that, click the title bar (or press `s`) and pick from the list; the bar then reads `pinned` instead of `auto`. `--player spotify` pins one from the start.
-- **Trivia in your language** — `--lang pt` (any Wikipedia code); articles missing from that edition fall back to English.
-- **Bars moving with nothing playing?** — that's the built-in simulation, not your audio. The visualizer's border reads `cava` only when real audio is coming through; otherwise it says why, e.g. `simulated — cava not installed`.
-- **Colors look off?** — theme colors come from `~/.local/state/omarchy/current/theme/colors.toml`. Without that file the app uses Textual's default palette.
+```
+▶  Bohemian Rhapsody — Queen   [auto · spotify ▾]
+```
+
+`auto` means the app picked for you. When several players are registered it
+prefers one that's playing, and a real music track outranks a browser tab left
+on a video — which is usually right, but not always.
+
+**Click the title bar** (or press `s`) to choose yourself:
+
+```
+  ● Auto        follow whichever player is playing
+    ⏸ chromium  MODERN WARFARE 4 BETA SLAMMING! — TeeP
+    ▶ spotify   Bohemian Rhapsody — Queen
+```
+
+Every registered player is listed with its status and current track, so a
+browser tab is easy to tell apart from your music player. Pick one and the bar
+switches to `[pinned · spotify ▾]`; pick **Auto** to hand the choice back.
+`esc`, or a click outside the panel, cancels.
+
+Pinning survives the player pausing or changing tracks — and if the pinned
+player isn't running at all, the bar says so instead of leaving you with a
+bare "Nothing playing".
+
+To start pinned, use `--player`:
+
+```bash
+legendary-lyrics --player spotify
+legendary-lyrics --list-players     # see what's registered
+```
+
+### Lyrics
+
+Lyrics come from [lrclib.net](https://lrclib.net). When a synced (LRC) version
+exists, the current line is highlighted and moves with the song; otherwise the
+plain text is shown.
+
+A popular song exists there in several cuts — single edit, remaster, live — and
+picking the wrong one makes synced lyrics drift further out of time the longer
+the track runs. The app prefers the version whose duration matches what's
+playing, and falls back to a fuzzy search ranked the same way when the exact
+lookup misses.
+
+If the words still don't line up, or the wrong song was matched, press `r`.
+That forgets what was cached for this track and fetches it again.
+
+### Trivia
+
+Below the album art is background on the album and the artist, pulled from
+Wikipedia. Scroll it with the mouse wheel, or with `↑` `↓` / `PgUp` / `PgDn`.
+
+It follows your locale's Wikipedia edition and falls back to English when an
+article is missing there — smaller editions cover far fewer albums. Override it
+with `--lang`:
+
+```bash
+legendary-lyrics --lang pt
+```
+
+Not interested? `--no-trivia` hides the panel and gives the album art the
+whole column.
+
+### The visualizer
+
+The strip along the bottom is driven by [cava](https://github.com/karlstav/cava)
+when it's installed, and by a built-in simulation when it isn't.
+
+**The panel's border tells you which.** It reads `cava` once real audio is
+coming through, and otherwise says why not — `simulated — cava not installed`.
+If the bars are moving but the border doesn't say `cava`, you're watching an
+animation, not your music. The bars settle flat while playback is paused.
+
+`--bars N` changes how many there are.
+
+### Album art
+
+On terminals that implement the Kitty graphics protocol — Kitty, Ghostty, foot,
+WezTerm — the cover is drawn as a real image at full resolution. Everywhere
+else it falls back to ANSI half-blocks, which is blockier but works on any
+true-color terminal. Support is detected by asking the terminal directly, so
+terminals that implement the protocol without advertising it still get images.
+
+The panel is sized to the artwork's real aspect ratio, and everything
+re-renders when you resize the terminal.
+
+If your player exposes no usable cover, one is looked up on the iTunes Search
+API instead.
+
+### The cache
+
+Lyrics, artwork and trivia are stored under `~/.cache/legendary-lyrics`, so a
+track you've played before comes back instantly and works with no network. The
+artwork directory is capped at 64 MB, dropping the least recently used first.
+
+```bash
+legendary-lyrics --no-cache       # don't read or write it at all
+legendary-lyrics --clear-cache    # delete everything cached, then exit
+```
+
+Remember that `r` re-fetches just the current track — reach for it before
+clearing the whole cache.
+
+### Colors
+
+If you're on [Omarchy](https://omarchy.org), the app follows your active
+desktop theme. Everywhere else it uses Textual's palette.
+
+---
+
+## Command-line options
+
+| Option              | Effect                                                                 |
+|---------------------|------------------------------------------------------------------------|
+| `-p`, `--player`    | Follow a specific player instead of auto-selecting                     |
+| `-b`, `--bars N`    | Visualizer bar count (default 60)                                      |
+| `--lang CODE`       | Wikipedia edition for trivia, falling back to English (default: locale) |
+| `--no-trivia`       | Hide the trivia panel; album art takes the whole column                |
+| `--no-cache`        | Never read or write the on-disk cache                                  |
+| `--clear-cache`     | Delete everything cached, then exit                                    |
+| `--list-players`    | Print the registered MPRIS players, then exit                          |
+| `-V`, `--version`   | Print the version                                                      |
+
+`r` refreshes the current track and `q` quits.
+
+---
+
+## Troubleshooting
+
+**Nothing playing, but something is.**
+Your player may not expose MPRIS. Check with `legendary-lyrics --list-players`
+— if it's not in that list, the app can't see it.
+
+**It's following the wrong player.**
+Click the title bar or press `s` and pick the right one. `--player NAME` pins
+it from the start.
+
+**The lyrics drift out of sync.**
+Press `r`. That drops the cached match and refetches, usually landing on a
+version with the right duration.
+
+**No lyrics at all.**
+The track may simply not be in lrclib.net's database. Nothing to be done except
+contribute it there.
+
+**The album art is blocky.**
+Your terminal doesn't implement the Kitty graphics protocol, so half-blocks are
+used. Kitty, Ghostty, foot and WezTerm all support it.
+
+**The bars move when nothing is playing.**
+That's the simulation. Install `cava` and check that the panel's border reads
+`cava` afterwards.
+
+**The trivia is about the band when I wanted the album.**
+The album probably has no Wikipedia article in that edition. When nothing
+matches the album the panel is left empty rather than repeating the artist's
+biography, so an empty half usually means "no article", not a bug.
 
 ---
 
 ## Compatibility
 
-| Component      | Requirement                                                                      |
-|----------------|----------------------------------------------------------------------------------|
-| Python         | 3.9+                                                                             |
-| Terminal       | Any true-color terminal; Kitty, Ghostty, foot and WezTerm additionally get full-resolution album art |
-| Audio          | PulseAudio or PipeWire (for `cava`)                                              |
-| MPRIS players  | Spotify, Firefox, Chromium, VLC, MPD (+plugin), Rhythmbox, Clementine…            |
+| Component     | Requirement                                                                                          |
+|---------------|------------------------------------------------------------------------------------------------------|
+| Python        | 3.9+                                                                                                 |
+| Terminal      | Any true-color terminal; Kitty, Ghostty, foot and WezTerm additionally get full-resolution album art  |
+| Audio         | PulseAudio or PipeWire, for `cava`                                                                   |
+| MPRIS players | Spotify, Firefox, Chromium, VLC, MPD (+plugin), Rhythmbox, Clementine…                                |
 
 ---
 
