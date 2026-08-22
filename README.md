@@ -1,6 +1,6 @@
 # Legendary Lyrics
 
-Terminal music visualizer with album art, synced lyrics, Wikipedia trivia and bar animation.
+Terminal music visualizer with album art, synced lyrics, Wikipedia trivia and bar animation — with playback controls, so you never leave the terminal to skip a track.
 
 ```
 ┌───────────────────────────────────────────────────────────────────────┐
@@ -23,18 +23,20 @@ Terminal music visualizer with album art, synced lyrics, Wikipedia trivia and ba
 │ │  ▂▄█▆▃ ▁▅█▇▄▂ ▃▆█▅▁ ▂▇█▄▃▁ ▅█▆▂ ▁▃▇█▅▂ ▄█▃▁ ▂▆█▇▄▃ ▁▄█▅▂ ▃▇█▆▂▄▃▁ │ │
 │ ╰───────────────────────────────────────────────────────────────────╯ │
 │ 1:23 ▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 5:55          │
-│  q  Quit    r  Refresh                                                │
+│ space Play/Pause  n Next  p Prev  ←/→ ±5s  r Refresh  q Quit          │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
 **Features:**
 
 - **Album art** — rendered with the Kitty graphics protocol on terminals that support it (detected by an active probe, not a hardcoded list, so `foot` and friends get full resolution too), falling back to high-resolution ANSI half-block art everywhere else. The panel is sized to the artwork's real aspect ratio and re-renders on terminal resize.
-- **Lyrics** from [lrclib.net](https://lrclib.net) — synced line-by-line with the current line highlighted, plain text when no LRC exists.
+- **Lyrics** from [lrclib.net](https://lrclib.net) — synced line-by-line with the current line highlighted, plain text when no LRC exists. The version whose duration matches the track is preferred, so a single edit or remaster doesn't leave synced lyrics drifting out of time.
+- **Playback controls** — play / pause, skip, and seek without leaving the app.
 - **Trivia panel** — Wikipedia background on the current album and artist, scrollable, below the art.
 - **Bar visualizer** — a full-width strip driven by `cava` when installed, or a built-in sine-wave simulation otherwise.
 - **Live playback sync** — progress bar, elapsed / total time and play / pause / stop icon, read from the player that is actually playing when several MPRIS players are registered.
 - **Desktop theme aware** — follows the active [Omarchy](https://omarchy.org) theme's colors, falling back to Textual's palette elsewhere.
+- **Cached** — lyrics, art and trivia are stored under `~/.cache/legendary-lyrics`, so a track you've already played comes back instantly and works offline.
 
 ---
 
@@ -99,21 +101,42 @@ legendary-lyrics
 
 ### Keyboard shortcuts
 
-| Key | Action        |
-|-----|---------------|
-| `q` | Quit          |
-| `r` | Force refresh |
+| Key     | Action                                          |
+|---------|-------------------------------------------------|
+| `space` | Play / pause                                    |
+| `n`     | Next track                                      |
+| `p`     | Previous track                                  |
+| `→` `←` | Seek forward / back 5 seconds                   |
+| `r`     | Refetch this track's lyrics, art and trivia     |
+| `q`     | Quit                                            |
 
-The trivia panel scrolls with the mouse wheel, or with the arrow keys / `PgUp` / `PgDn` while it has focus.
+Controls are sent to whichever player is being followed; a player that doesn't implement one (browsers often lack seeking) simply ignores it. `r` drops the track's cache entries before refetching, so it's the way out of a bad lyrics match.
+
+The trivia panel scrolls with the mouse wheel, or with `↑` `↓` / `PgUp` / `PgDn`.
+
+### Command-line options
+
+| Option              | Effect                                                              |
+|---------------------|---------------------------------------------------------------------|
+| `-p`, `--player`    | Follow a specific player instead of auto-selecting (`--player spotify`) |
+| `-b`, `--bars N`    | Visualizer bar count (default 60)                                   |
+| `--lang CODE`       | Wikipedia edition for trivia, falling back to English (default: your locale) |
+| `--no-trivia`       | Hide the trivia panel; the album art takes the whole column          |
+| `--no-cache`        | Never read or write the on-disk cache                               |
+| `--clear-cache`     | Delete everything cached, then exit                                 |
+| `--list-players`    | Print the registered MPRIS players, then exit                       |
+| `-V`, `--version`   | Print the version                                                   |
 
 ### Tips
 
 - **Resize the terminal** — art, lyrics and bars all re-render at the new size.
 - **Blocky album art?** — the terminal doesn't implement the Kitty graphics protocol, so the half-block renderer is used. Kitty, Ghostty, foot and WezTerm all support it.
 - **No album art at all?** — if the player exposes no usable `mpris:artUrl`, the cover is looked up on the iTunes Search API instead. A track that matches nothing there shows an empty panel.
-- **No lyrics shown?** — the track may not be in lrclib.net's database. Synced (LRC) lyrics are preferred, plain text is the fallback.
-- **Wrong track detected?** — make sure the media player exposes MPRIS. Run `playerctl status` to verify.
-- **Multiple players** — the player that is actually playing wins; idle ones (a stale browser tab, say) are ignored. Force a specific one with `playerctl -p spotify status`.
+- **No lyrics shown?** — the track may not be in lrclib.net's database. An exact lookup is tried first, then a fuzzy search ranked by how closely each version's duration matches what's playing.
+- **Lyrics out of sync?** — press `r`. That forgets the cached match and refetches, usually landing on a version with the right duration.
+- **Wrong track detected?** — make sure the media player exposes MPRIS. Run `legendary-lyrics --list-players` to see what's registered.
+- **Multiple players** — the one that's actually playing wins, and a real music track outranks a browser tab left on a video. Pin one with `--player spotify`.
+- **Trivia in your language** — `--lang pt` (any Wikipedia code); articles missing from that edition fall back to English.
 - **Colors look off?** — theme colors come from `~/.local/state/omarchy/current/theme/colors.toml`. Without that file the app uses Textual's default palette.
 
 ---

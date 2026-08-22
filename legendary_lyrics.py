@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Legendary Lyrics — terminal music visualizer with album art, lyrics and bars."""
 
+import argparse
 import asyncio
 import base64
+import hashlib
 import io
+import json
 import math
 import os
 import random
@@ -11,17 +14,157 @@ import re
 import select as _select
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
+import time
 import tty
 from pathlib import Path
 from typing import Optional
+
+__version__ = '1.2.0'
+
+
+# ─── options ─────────────────────────────────────────────────────────────────
+
+class Options:
+    """Runtime settings, populated from the command line in main()."""
+    player: str = ''        # force a specific MPRIS player, '' = auto-select
+    bars: int = 60          # visualizer bar count
+    trivia: bool = True     # show the Wikipedia trivia panel
+    cache: bool = True      # read/write the on-disk cache
+    lang: str = 'en'        # Wikipedia language edition
+
+
+OPTS = Options()
+
+
+# ─── cache ───────────────────────────────────────────────────────────────────
+
+_CACHE_DIR = Path(
+    os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache'
+) / 'legendary-lyrics'
+
+# A track missing from lrclib today may be added tomorrow, so remember misses
+# only briefly; a hit is stable and kept until the art budget evicts it.
+_MISS_TTL = 24 * 3600
+# Cover art is by far the bulkiest thing we store, so cap just that directory.
+_ART_BUDGET = 64 * 1024 * 1024
+
+
+def _cache_path(kind: str, *parts: str) -> Path:
+    key = hashlib.sha1('\x1f'.join(parts).encode('utf-8', 'replace')).hexdigest()
+    return _CACHE_DIR / kind / key
+
+
+def _cache_load(kind: str, *parts: str):
+    """Return the cached value, or None on a miss. Cached misses (falsy values)
+    expire after _MISS_TTL so a later upload to lrclib/Wikipedia is picked up."""
+    if not OPTS.cache:
+        return None
+    path = _cache_path(kind, *parts)
+    try:
+        entry = json.loads(path.read_text())
+        if not entry['v'] and time.time() - entry['t'] > _MISS_TTL:
+            return None
+        return entry['v']
+    except Exception:
+        return None
+
+
+def _cache_store(kind: str, value, *parts: str) -> None:
+    if not OPTS.cache:
+        return
+    path = _cache_path(kind, *parts)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({'t': time.time(), 'v': value}))
+    except Exception:
+        pass
+
+
+def _cache_load_bytes(kind: str, *parts: str) -> Optional[bytes]:
+    if not OPTS.cache:
+        return None
+    path = _cache_path(kind, *parts)
+    try:
+        data = path.read_bytes()
+        # Touch on read so pruning evicts least-recently-used art first.
+        os.utime(path, None)
+        return data or None
+    except Exception:
+        return None
+
+
+def _cache_store_bytes(kind: str, data: Optional[bytes], *parts: str) -> None:
+    if not OPTS.cache or not data:
+        return
+    path = _cache_path(kind, *parts)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        _prune_cache(path.parent, _ART_BUDGET)
+    except Exception:
+        pass
+
+
+def _prune_cache(directory: Path, budget: int) -> None:
+    """Drop least-recently-used files until the directory fits the budget."""
+    try:
+        files = [(f.stat().st_atime, f.stat().st_size, f) for f in directory.iterdir()]
+    except Exception:
+        return
+    total = sum(size for _, size, _ in files)
+    if total <= budget:
+        return
+    for _, size, f in sorted(files):
+        try:
+            f.unlink()
+            total -= size
+        except Exception:
+            pass
+        if total <= budget:
+            return
+
+
+def forget_track(track: dict) -> None:
+    """Drop everything cached for one track, so a manual refresh really
+    refetches instead of replaying the same (possibly wrong) match."""
+    artist = track.get('artist', '')
+    title = track.get('title', '')
+    album = track.get('album', '')
+    duration = str(int(round(track.get('length', 0.0))))
+    for path in (
+        _cache_path('lyrics', artist, title, album, duration),
+        _cache_path('art', artist, album, title),
+        _cache_path('trivia', OPTS.lang, artist, album),
+    ):
+        try:
+            path.unlink()
+        except Exception:
+            pass
+
+
+def clear_cache() -> int:
+    """Delete every cached file. Returns the number of files removed."""
+    removed = 0
+    for path in sorted(_CACHE_DIR.rglob('*'), reverse=True):
+        try:
+            if path.is_file():
+                path.unlink()
+                removed += 1
+            else:
+                path.rmdir()
+        except Exception:
+            pass
+    return removed
 
 import httpx
 from PIL import Image
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.theme import Theme
 from textual.widgets import Static, Footer
 
@@ -32,59 +175,96 @@ def _run(cmd: list[str]) -> str:
     return subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True).strip()
 
 
-def _select_player() -> tuple[str, str]:
-    """Pick the most relevant MPRIS player when several are registered (e.g.
-    a browser leaves a stopped/idle MPRIS handle behind alongside a real
-    player). playerctl commands run without -p resolve each call against
-    whichever player it feels like, so status/position/metadata can end up
-    mixed from different players — prefer one that's actually playing."""
+# Everything the UI needs about every player, in a single playerctl call.
+# The old approach spawned one process per field per poll — about ten a second
+# — and, worse, each bare playerctl call resolved the player independently, so
+# status could come from one player and position from another.
+_FIELDS = ('playerName', 'status', 'position', 'mpris:length',
+           'artist', 'title', 'album', 'mpris:artUrl')
+_SEP = '\x1f'   # unit separator: cannot appear inside a title or album
+_FORMAT = _SEP.join('{{%s}}' % f for f in _FIELDS)
+
+# mpris:length is in microseconds, but players on live content (a browser on a
+# stream, internet radio) report INT64_MAX. Treat anything over a day as
+# unknown instead of drawing a progress bar spanning 292 000 years.
+_MAX_LENGTH = 24 * 3600
+
+EMPTY_TRACK = {
+    'player': '', 'status': 'Stopped', 'title': '', 'artist': '', 'album': '',
+    'art_url': '', 'position': 0.0, 'length': 0.0,
+}
+
+
+def _parse_player_line(line: str) -> Optional[dict]:
+    parts = line.split(_SEP)
+    if len(parts) != len(_FIELDS):
+        return None
+    name, status, position, length, artist, title, album, art_url = parts
     try:
-        players = _run(['playerctl', '-l']).splitlines()
-    except subprocess.CalledProcessError:
-        return '', 'Stopped'
-    statuses = {}
-    for p in players:
-        try:
-            statuses[p] = _run(['playerctl', '-p', p, 'status'])
-        except subprocess.CalledProcessError:
-            continue
-    for want in ('Playing', 'Paused'):
-        for p, s in statuses.items():
-            if s == want:
-                return p, s
-    if players:
-        return players[0], statuses.get(players[0], 'Stopped')
-    return '', 'Stopped'
+        pos = float(position) / 1e6
+    except ValueError:
+        pos = 0.0
+    try:
+        dur = int(length) / 1e6
+    except ValueError:
+        dur = 0.0
+    if not 0 < dur <= _MAX_LENGTH:
+        dur = 0.0
+    return {
+        'player': name, 'status': status or 'Stopped', 'position': pos,
+        'length': dur, 'artist': artist, 'title': title, 'album': album,
+        'art_url': art_url,
+    }
+
+
+def _players_snapshot() -> list[dict]:
+    try:
+        out = _run(['playerctl', '-a', 'metadata', '--format', _FORMAT])
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
+    return [p for p in (_parse_player_line(ln) for ln in out.splitlines()) if p]
+
+
+def _rank(player: dict) -> tuple:
+    """Sort key for choosing among several registered players. Prefers one
+    that is actually playing, then one that looks like a real music track —
+    a browser tab sitting on a video shouldn't outrank a music player."""
+    status_rank = {'Playing': 2, 'Paused': 1}.get(player['status'], 0)
+    return (
+        status_rank,
+        bool(player['length']),                      # sane duration
+        bool(player['album']),                       # albums mean music
+        bool(player['artist'] and player['title']),
+    )
+
+
+def _pick_player(players: list[dict]) -> Optional[dict]:
+    if OPTS.player:
+        for player in players:
+            if player['player'].startswith(OPTS.player):
+                return player
+        return None
+    return max(players, key=_rank) if players else None
 
 
 def get_track() -> dict:
+    player = _pick_player(_players_snapshot())
+    return player if player else dict(EMPTY_TRACK)
+
+
+def player_command(player: str, *args: str) -> None:
+    """Send a playerctl command, ignoring failures — not every player
+    implements every control, and a player can vanish between poll and key."""
+    if not player:
+        return
     try:
-        player, status = _select_player()
-        if not player:
-            return {'status': 'Stopped', 'title': '', 'artist': '', 'album': '',
-                    'art_url': '', 'position': 0.0, 'length': 0.0}
-        base = ['playerctl', '-p', player]
-        result: dict = {'status': status}
-        for key, field in [
-            ('artist', 'artist'), ('title', 'title'),
-            ('album', 'album'), ('art_url', 'mpris:artUrl'),
-        ]:
-            try:
-                result[key] = _run(base + ['metadata', field])
-            except subprocess.CalledProcessError:
-                result[key] = ''
-        try:
-            result['position'] = float(_run(base + ['position']))
-        except (subprocess.CalledProcessError, ValueError):
-            result['position'] = 0.0
-        try:
-            result['length'] = int(_run(base + ['metadata', 'mpris:length'])) / 1e6
-        except (subprocess.CalledProcessError, ValueError):
-            result['length'] = 0.0
-        return result
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return {'status': 'Stopped', 'title': '', 'artist': '', 'album': '',
-                'art_url': '', 'position': 0.0, 'length': 0.0}
+        subprocess.run(
+            ['playerctl', '-p', player, *args],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=2, check=False,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        pass
 
 
 # ─── album art ───────────────────────────────────────────────────────────────
@@ -231,22 +411,31 @@ async def _fetch_art_from_web(artist: str, title: str, album: str) -> Optional[b
         return None
 
 
+async def _fetch_art_from_player(url: str) -> Optional[bytes]:
+    try:
+        if url.startswith('file://'):
+            return Path(url[7:]).read_bytes() or None
+        async with httpx.AsyncClient() as c:
+            r = await c.get(url, timeout=5.0, follow_redirects=True)
+            r.raise_for_status()
+            return r.content or None
+    except Exception:
+        return None
+
+
 async def fetch_art_bytes(url: str, artist: str = '', title: str = '', album: str = '') -> Optional[bytes]:
-    if url:
-        try:
-            if url.startswith('file://'):
-                data = Path(url[7:]).read_bytes()
-                if data:
-                    return data
-            else:
-                async with httpx.AsyncClient() as c:
-                    r = await c.get(url, timeout=5.0, follow_redirects=True)
-                    r.raise_for_status()
-                    if r.content:
-                        return r.content
-        except Exception:
-            pass
-    return await _fetch_art_from_web(artist, title, album)
+    # Keyed on the track, not the art URL: players hand out short-lived CDN
+    # links that change between sessions for the very same cover.
+    cached = _cache_load_bytes('art', artist, album, title)
+    if cached:
+        return cached
+
+    data = await _fetch_art_from_player(url) if url else None
+    if not data:
+        data = await _fetch_art_from_web(artist, title, album)
+
+    _cache_store_bytes('art', data, artist, album, title)
+    return data
 
 
 # ─── lyrics ──────────────────────────────────────────────────────────────────
@@ -261,62 +450,170 @@ def _parse_lrc(text: str) -> list[tuple[float, str]]:
     return sorted(out)
 
 
-async def fetch_lyrics_data(artist: str, title: str, album: str = '') -> dict:
+# How far a candidate's duration may sit from the playing track before we
+# consider it a different cut of the song.
+_LRC_TOLERANCE = 5.0
+
+
+async def _lrclib_get(client, artist: str, title: str,
+                      album: str, duration: float) -> dict:
+    params: dict = {'artist_name': artist, 'track_name': title}
+    if album:
+        params['album_name'] = album
+    if duration:
+        params['duration'] = int(round(duration))
+    r = await client.get('https://lrclib.net/api/get', params=params, timeout=10.0)
+    return r.json() if r.status_code == 200 else {}
+
+
+async def _lrclib_search(client, artist: str, title: str, duration: float) -> dict:
+    """Fuzzy fallback: rank every known version of the song, preferring synced
+    lyrics and the duration closest to what is actually playing."""
+    r = await client.get(
+        'https://lrclib.net/api/search',
+        params={'artist_name': artist, 'track_name': title}, timeout=10.0,
+    )
+    if r.status_code != 200:
+        return {}
+    results = [e for e in r.json()
+               if e.get('syncedLyrics') or e.get('plainLyrics')]
+    if not results:
+        return {}
+    return max(results, key=lambda e: (
+        bool(e.get('syncedLyrics')),
+        -abs((e.get('duration') or 0.0) - duration) if duration else 0.0,
+    ))
+
+
+async def fetch_lyrics_data(artist: str, title: str, album: str = '',
+                            duration: float = 0.0) -> dict:
+    """Fetch lyrics from lrclib, preferring a version whose duration matches
+    the track being played. lrclib carries several cuts of a popular song —
+    single edit, remaster, live — and picking the wrong one makes synced
+    lyrics drift further out of time the longer the song runs."""
     if not (artist and title):
         return {}
+
+    key_duration = str(int(round(duration)))
+    cached = _cache_load('lyrics', artist, title, album, key_duration)
+    if cached is not None:
+        return cached
+
     try:
-        params: dict = {'artist_name': artist, 'track_name': title}
-        if album:
-            params['album_name'] = album
         async with httpx.AsyncClient() as c:
-            r = await c.get('https://lrclib.net/api/get', params=params, timeout=10.0)
-            if r.status_code == 200:
-                return r.json()
+            data = await _lrclib_get(c, artist, title, album, duration)
+            off_by = abs((data.get('duration') or 0.0) - duration)
+            if not data or (duration and off_by > _LRC_TOLERANCE):
+                better = await _lrclib_search(c, artist, title, duration)
+                if better:
+                    data = better
     except Exception:
-        pass
-    return {}
+        return {}   # a network hiccup is not a miss worth remembering
+
+    _cache_store('lyrics', data, artist, title, album, key_duration)
+    return data
 
 
 # ─── trivia ──────────────────────────────────────────────────────────────────
 
-async def _wiki_extract(query: str) -> str:
-    """Fetch the intro extract of the best-matching Wikipedia article."""
+def _wiki_normalize(title: str) -> str:
+    """Strip a disambiguation suffix and punctuation so 'A Night at the Opera
+    (Queen album)' can be compared against the album name the player reports."""
+    title = re.sub(r'\s*\([^)]*\)\s*$', '', title)
+    return re.sub(r'[^a-z0-9]+', '', title.lower())
+
+
+def _wiki_rank(title: str, prefer: str) -> int:
+    """How well a result title matches the thing we actually searched for."""
+    norm_title, norm_prefer = _wiki_normalize(title), _wiki_normalize(prefer)
+    if not norm_prefer:
+        return 0
+    if norm_title == norm_prefer:
+        return 3
+    if norm_title.startswith(norm_prefer):
+        return 2
+    if norm_prefer in norm_title:
+        return 1
+    return 0
+
+
+async def _wiki_extract(query: str, lang: str, prefer: str = '') -> str:
+    """Fetch the intro extract of the best-matching Wikipedia article.
+
+    The top search hit is often the wrong article — searching an album returns
+    the band's page on smaller editions, and 'Kid A' ranks below 'Kid A Mnesia'
+    even on en.wikipedia — so pull a few results and pick by title instead.
+    """
     if not query:
         return ''
     try:
         async with httpx.AsyncClient() as c:
             r = await c.get(
-                'https://en.wikipedia.org/w/api.php',
+                f'https://{lang}.wikipedia.org/w/api.php',
                 params={
                     'action': 'query',
                     'generator': 'search',
                     'gsrsearch': query,
-                    'gsrlimit': 1,
+                    'gsrlimit': 3,
                     'prop': 'extracts',
                     'exintro': 1,
                     'explaintext': 1,
                     'format': 'json',
                 },
                 timeout=8.0,
-                headers={'User-Agent': 'legendary-lyrics/1.0'},
+                headers={'User-Agent': f'legendary-lyrics/{__version__}'},
             )
             r.raise_for_status()
-            pages = r.json().get('query', {}).get('pages', {})
-            for page in pages.values():
-                extract = page.get('extract', '').strip()
-                if extract:
-                    return extract
+            pages = list(r.json().get('query', {}).get('pages', {}).values())
     except Exception:
-        pass
+        return ''
+
+    # Best title match first, search rank breaking ties.
+    pages.sort(key=lambda pg: (-_wiki_rank(pg.get('title', ''), prefer),
+                               pg.get('index', 99)))
+    for page in pages:
+        extract = page.get('extract', '').strip()
+        if not extract:
+            continue
+        # Nothing resembled what we asked for: better to show nothing than to
+        # repeat the artist's biography under the album's heading.
+        if prefer and not _wiki_rank(page.get('title', ''), prefer):
+            return ''
+        return extract
     return ''
+
+
+async def _wiki_extract_localized(query: str, prefer: str = '') -> str:
+    """Try the user's Wikipedia edition first, then fall back to English —
+    smaller editions cover far fewer albums than en.wikipedia does."""
+    text = await _wiki_extract(query, OPTS.lang, prefer)
+    if not text and OPTS.lang != 'en':
+        text = await _wiki_extract(query, 'en', prefer)
+    return text
+
+
+async def _no_trivia() -> tuple[str, str]:
+    """Stand-in for fetch_trivia when the panel is hidden, so the poll can
+    gather all three lookups uniformly without paying for a fetch."""
+    return '', ''
 
 
 async def fetch_trivia(artist: str, album: str) -> tuple[str, str]:
     """Fetch background info about the album and the artist from Wikipedia."""
+    cached = _cache_load('trivia', OPTS.lang, artist, album)
+    if cached is not None:
+        return cached[0], cached[1]
+
     album_query = f'{album} {artist} album' if album and artist else ''
-    album_text, artist_text = await asyncio.gather(
-        _wiki_extract(album_query), _wiki_extract(artist),
-    )
+    try:
+        album_text, artist_text = await asyncio.gather(
+            _wiki_extract_localized(album_query, album),
+            _wiki_extract_localized(artist, artist),
+        )
+    except Exception:
+        return '', ''
+
+    _cache_store('trivia', [album_text, artist_text], OPTS.lang, artist, album)
     return album_text, artist_text
 
 
@@ -560,7 +857,8 @@ class ArtWidget(Static):
 
         parent = self.parent
         if parent is not None and parent.size.height > 0:
-            max_total = int(parent.size.height * 0.7)
+            share = 0.7 if OPTS.trivia else 1.0
+            max_total = int(parent.size.height * share)
             disp_rows = min(disp_rows, max(1, max_total - 2))
 
         self.styles.height = disp_rows + 2  # + top/bottom border
@@ -781,8 +1079,13 @@ class LegendaryLyricsApp(App):
     }
     """
     BINDINGS = [
-        ('q', 'quit', 'Quit'),
+        ('space', 'play_pause', 'Play/Pause'),
+        ('n', 'next_track', 'Next'),
+        ('p', 'prev_track', 'Prev'),
+        ('left', 'seek_back', '-5s'),
+        ('right', 'seek_forward', '+5s'),
         ('r', 'refresh', 'Refresh'),
+        ('q', 'quit', 'Quit'),
     ]
 
     def __init__(self):
@@ -790,14 +1093,15 @@ class LegendaryLyricsApp(App):
         self._track: dict = {}
         self._lrc: list[tuple[float, str]] = []
         self._plain: list[str] = []
-        self._viz = Visualizer(n_bars=60)
+        self._viz = Visualizer(n_bars=OPTS.bars)
 
     def compose(self) -> ComposeResult:
         yield Static('Legendary Lyrics', id='info')
         with Horizontal(id='columns'):
             with Vertical(id='left-col'):
                 yield ArtWidget(id='art')
-                yield TriviaWidget(id='trivia')
+                if OPTS.trivia:
+                    yield TriviaWidget(id='trivia')
             yield LyricsWidget(id='lyrics')
         yield VizWidget(id='viz')
         yield Static('', id='progress')
@@ -814,6 +1118,15 @@ class LegendaryLyricsApp(App):
         self.set_interval(1 / 20, self._tick_viz)
         await self._poll()
 
+    def _find(self, selector: str, kind):
+        """Widget lookup that tolerates a torn-down tree. The 1 s and 20 Hz
+        timers can fire after the screen is gone during shutdown, and _poll
+        awaits the network between lookups, so the app may close mid-poll."""
+        try:
+            return self.query_one(selector, kind)
+        except NoMatches:
+            return None
+
     async def _poll(self):
         track = await asyncio.to_thread(get_track)
 
@@ -829,14 +1142,17 @@ class LegendaryLyricsApp(App):
         artist = track.get('artist') or ''
         sep = ' — ' if artist else ''
 
-        self.query_one('#info', Static).update(f'{icon}  {title}{sep}{artist}')
+        info = self._find('#info', Static)
+        if info is None:
+            return
+        info.update(f'{icon}  {title}{sep}{artist}')
         self._update_progress()
 
         if song_changed:
             self._lrc = []
             self._plain = []
-            self.query_one('#lyrics', LyricsWidget).set_lyrics([])
-            self.query_one('#trivia', TriviaWidget).set_trivia('', '', '', '')
+            self._set_lyrics([])
+            self._set_trivia('', '', '', '')
 
             art_task = asyncio.create_task(fetch_art_bytes(
                 track.get('art_url', ''), track.get('artist', ''),
@@ -844,18 +1160,22 @@ class LegendaryLyricsApp(App):
             ))
             lyrics_task = asyncio.create_task(
                 fetch_lyrics_data(
-                    track.get('artist', ''), track.get('title', ''), track.get('album', '')
+                    track.get('artist', ''), track.get('title', ''),
+                    track.get('album', ''), track.get('length', 0.0),
                 )
             )
             trivia_task = asyncio.create_task(
                 fetch_trivia(track.get('artist', ''), track.get('album', ''))
+                if OPTS.trivia else _no_trivia()
             )
             art_data, lyrics_data, (album_text, artist_text) = await asyncio.gather(
                 art_task, lyrics_task, trivia_task
             )
 
-            self.query_one('#art', ArtWidget).set_image_data(art_data)
-            self.query_one('#trivia', TriviaWidget).set_trivia(
+            art = self._find('#art', ArtWidget)
+            if art is not None:
+                art.set_image_data(art_data)
+            self._set_trivia(
                 track.get('album', ''), track.get('artist', ''), album_text, artist_text
             )
 
@@ -869,9 +1189,9 @@ class LegendaryLyricsApp(App):
             elif plain:
                 self._lrc = []
                 self._plain = plain.splitlines()
-                self.query_one('#lyrics', LyricsWidget).set_lyrics(self._plain)
+                self._set_lyrics(self._plain)
             else:
-                self.query_one('#lyrics', LyricsWidget).set_lyrics([])
+                self._set_lyrics([])
 
     def _sync_lrc(self):
         if not self._lrc:
@@ -882,13 +1202,16 @@ class LegendaryLyricsApp(App):
             if t <= pos:
                 idx = i
         lines = [ln for _, ln in self._lrc]
-        self.query_one('#lyrics', LyricsWidget).set_lyrics(lines, idx)
+        self._set_lyrics(lines, idx)
 
     def _update_progress(self):
+        progress = self._find('#progress', Static)
+        if progress is None:
+            return
         pos = self._track.get('position', 0.0)
         length = self._track.get('length', 0.0)
         if length <= 0:
-            self.query_one('#progress', Static).update('')
+            progress.update('')
             return
         frac = min(1.0, pos / length)
         bar_w = max(10, self.size.width - 16)
@@ -896,12 +1219,12 @@ class LegendaryLyricsApp(App):
         bar = '▓' * filled + '░' * (bar_w - filled)
         m1, s1 = divmod(int(pos), 60)
         m2, s2 = divmod(int(length), 60)
-        self.query_one('#progress', Static).update(
-            f'{m1}:{s1:02d} {bar} {m2}:{s2:02d}'
-        )
+        progress.update(f'{m1}:{s1:02d} {bar} {m2}:{s2:02d}')
 
     def _tick_viz(self):
-        self.query_one('#viz', VizWidget).render_bars(self._viz.heights)
+        viz = self._find('#viz', VizWidget)
+        if viz is not None:
+            viz.render_bars(self._viz.heights)
 
     async def on_unmount(self):
         await self._viz.stop()
@@ -909,15 +1232,134 @@ class LegendaryLyricsApp(App):
     async def action_quit(self):
         self.exit()
 
+    def _set_lyrics(self, lines: list[str], current: int = -1) -> None:
+        widget = self._find('#lyrics', LyricsWidget)
+        if widget is not None:
+            widget.set_lyrics(lines, current)
+
+    def _set_trivia(self, album: str, artist: str,
+                    album_text: str, artist_text: str) -> None:
+        """No-op when the panel is hidden with --no-trivia."""
+        if not OPTS.trivia:
+            return
+        widget = self._find('#trivia', TriviaWidget)
+        if widget is not None:
+            widget.set_trivia(album, artist, album_text, artist_text)
+
+    async def _control(self, *args: str) -> None:
+        """Run a playerctl command against the player we're following, then
+        re-poll so the UI reflects it without waiting for the next tick."""
+        player = self._track.get('player', '')
+        if not player:
+            return
+        await asyncio.to_thread(player_command, player, *args)
+        await asyncio.sleep(0.15)   # let the player settle on D-Bus
+        await self._poll()
+
+    async def action_play_pause(self):
+        await self._control('play-pause')
+
+    async def action_next_track(self):
+        await self._control('next')
+
+    async def action_prev_track(self):
+        await self._control('previous')
+
+    async def action_seek_forward(self):
+        await self._control('position', '5+')
+
+    async def action_seek_back(self):
+        await self._control('position', '5-')
+
     async def action_refresh(self):
+        # A refresh should really refetch, so drop what we cached for this
+        # track first — otherwise 'r' just replays the same wrong match.
+        forget_track(self._track)
         self._track = {}
         await self._poll()
 
 
-if __name__ == '__main__':
+def _default_lang() -> str:
+    """Derive the Wikipedia edition from the locale, e.g. pt_BR.UTF-8 -> pt."""
+    for var in ('LC_ALL', 'LC_MESSAGES', 'LANG'):
+        value = os.environ.get(var, '')
+        if value and value not in ('C', 'POSIX'):
+            code = value.split('.')[0].split('_')[0].lower()
+            if len(code) == 2:
+                return code
+    return 'en'
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog='legendary-lyrics',
+        description='Terminal music visualizer with album art, synced lyrics '
+                    'and bar animation.',
+    )
+    parser.add_argument(
+        '-p', '--player', default='', metavar='NAME',
+        help='follow a specific MPRIS player (e.g. spotify) instead of '
+             'auto-selecting the one that is playing',
+    )
+    parser.add_argument(
+        '-b', '--bars', type=int, default=60, metavar='N',
+        help='number of visualizer bars (default: %(default)s)',
+    )
+    parser.add_argument(
+        '--lang', default=_default_lang(), metavar='CODE',
+        help='Wikipedia language edition for trivia, falling back to English '
+             '(default: taken from your locale)',
+    )
+    parser.add_argument(
+        '--no-trivia', action='store_true',
+        help='hide the trivia panel and give the album art the whole column',
+    )
+    parser.add_argument(
+        '--no-cache', action='store_true',
+        help='never read or write the on-disk cache',
+    )
+    parser.add_argument(
+        '--clear-cache', action='store_true',
+        help='delete all cached lyrics, art and trivia, then exit',
+    )
+    parser.add_argument(
+        '--list-players', action='store_true',
+        help='list the MPRIS players currently registered, then exit',
+    )
+    parser.add_argument(
+        '-V', '--version', action='version',
+        version=f'legendary-lyrics {__version__}',
+    )
+    args = parser.parse_args()
+
+    if args.clear_cache:
+        print(f'Removed {clear_cache()} cached files from {_CACHE_DIR}')
+        return 0
+
+    OPTS.player = args.player
+    OPTS.bars = max(8, min(256, args.bars))
+    OPTS.trivia = not args.no_trivia
+    OPTS.cache = not args.no_cache
+    OPTS.lang = args.lang
+
+    if args.list_players:
+        players = _players_snapshot()
+        if not players:
+            print('No MPRIS players registered.')
+            return 1
+        for player in players:
+            print(f"{player['player']:<24} {player['status']:<8} "
+                  f"{player['artist']} — {player['title']}")
+        return 0
+
     # Probe terminal capabilities before Textual takes over stdin: once the
     # app is running, its input loop competes with our raw tty reads for
     # escape-sequence responses, so queries done after start-up are unreliable.
     _kitty_supported()
     _get_cell_size()
     LegendaryLyricsApp().run()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
