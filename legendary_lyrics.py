@@ -666,6 +666,12 @@ class Visualizer:
     def __init__(self, n_bars: int = 24):
         self.n_bars = n_bars
         self.heights: list[float] = [0.0] * n_bars
+        # What is actually driving the bars, shown in the panel's border so a
+        # simulation is never mistaken for the real audio stream.
+        self.source: str = 'starting…'
+        # Whether a track is playing. The simulation has no idea on its own,
+        # and bars dancing over a paused track look broken.
+        self.active: bool = False
         self._task: Optional[asyncio.Task] = None
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._cfg_path: Optional[Path] = None
@@ -686,12 +692,27 @@ class Visualizer:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
+        except FileNotFoundError:
+            self.source = 'simulated — cava not installed'
+            await self._simulate()
+            return
+        except OSError:
+            self.source = 'simulated — cava failed to start'
+            await self._simulate()
+            return
+
+        try:
             frame_bytes = self.n_bars * 2
             while True:
                 data = await self._proc.stdout.readexactly(frame_bytes)
+                # Only a decoded frame proves cava is really feeding us; it can
+                # start fine and then die on an input it cannot open.
+                if self.source != 'cava':
+                    self.source = 'cava'
                 vals = struct.unpack(f'<{self.n_bars}H', data)
                 self.heights = [v / 65535.0 for v in vals]
-        except (FileNotFoundError, asyncio.IncompleteReadError, OSError):
+        except (asyncio.IncompleteReadError, OSError):
+            self.source = 'simulated — cava stopped'
             await self._simulate()
 
     async def _simulate(self):
@@ -699,6 +720,12 @@ class Visualizer:
         speeds = [random.uniform(0.08, 0.18) for _ in range(self.n_bars)]
         t = 0.0
         while True:
+            if not self.active:
+                # Decay to flat rather than cutting out, so pausing reads as
+                # the music stopping instead of the app freezing.
+                self.heights = [h * 0.85 for h in self.heights]
+                await asyncio.sleep(1 / 30)
+                continue
             beat = (math.sin(t * 0.5) + 1) / 2
             self.heights = [
                 max(0.0, min(1.0,
@@ -1278,6 +1305,7 @@ class LegendaryLyricsApp(App):
         artist = track.get('artist') or ''
         sep = ' — ' if artist else ''
 
+        self._viz.active = status == 'Playing'
         info = self._find('#info', InfoBar)
         if info is None:
             return
@@ -1370,8 +1398,11 @@ class LegendaryLyricsApp(App):
 
     def _tick_viz(self):
         viz = self._find('#viz', VizWidget)
-        if viz is not None:
-            viz.render_bars(self._viz.heights)
+        if viz is None:
+            return
+        if viz.border_title != self._viz.source:
+            viz.border_title = self._viz.source
+        viz.render_bars(self._viz.heights)
 
     async def on_unmount(self):
         await self._viz.stop()

@@ -19,7 +19,7 @@ Terminal music visualizer with album art, synced lyrics, Wikipedia trivia and ba
 │ │ Queen                │ │                                          │ │
 │ │ …British rock band   │ │                                          │ │
 │ ╰──────────────────────╯ ╰──────────────────────────────────────────╯ │
-│ ╭───────────────────────────────────────────────────────────────────╮ │
+│ ╭─ cava ────────────────────────────────────────────────────────────╮ │
 │ │  ▂▄█▆▃ ▁▅█▇▄▂ ▃▆█▅▁ ▂▇█▄▃▁ ▅█▆▂ ▁▃▇█▅▂ ▄█▃▁ ▂▆█▇▄▃ ▁▄█▅▂ ▃▇█▆▂▄▃▁ │ │
 │ ╰───────────────────────────────────────────────────────────────────╯ │
 │ 1:23 ▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 5:55          │
@@ -34,7 +34,7 @@ Terminal music visualizer with album art, synced lyrics, Wikipedia trivia and ba
 - **Playback controls** — play / pause, skip, and seek without leaving the app.
 - **Player picker** — click the title bar (or press `s`) to choose which player to follow, with each one's current track shown so you can tell a browser tab from your music player.
 - **Trivia panel** — Wikipedia background on the current album and artist, scrollable, below the art.
-- **Bar visualizer** — a full-width strip driven by `cava` when installed, or a built-in sine-wave simulation otherwise.
+- **Bar visualizer** — a full-width strip driven by `cava` when installed, or a built-in simulation otherwise. The panel's border names which of the two is running, and the bars settle flat while playback is paused.
 - **Live playback sync** — progress bar, elapsed / total time and play / pause / stop icon, read from the player that is actually playing when several MPRIS players are registered.
 - **Desktop theme aware** — follows the active [Omarchy](https://omarchy.org) theme's colors, falling back to Textual's palette elsewhere.
 - **Cached** — lyrics, art and trivia are stored under `~/.cache/legendary-lyrics`, so a track you've already played comes back instantly and works offline.
@@ -139,6 +139,7 @@ The trivia panel scrolls with the mouse wheel, or with `↑` `↓` / `PgUp` / `P
 - **Wrong track detected?** — make sure the media player exposes MPRIS. Run `legendary-lyrics --list-players` to see what's registered.
 - **Multiple players** — the one that's actually playing wins, and a real music track outranks a browser tab left on a video. To override that, click the title bar (or press `s`) and pick from the list; the bar then reads `pinned` instead of `auto`. `--player spotify` pins one from the start.
 - **Trivia in your language** — `--lang pt` (any Wikipedia code); articles missing from that edition fall back to English.
+- **Bars moving with nothing playing?** — that's the built-in simulation, not your audio. The visualizer's border reads `cava` only when real audio is coming through; otherwise it says why, e.g. `simulated — cava not installed`.
 - **Colors look off?** — theme colors come from `~/.local/state/omarchy/current/theme/colors.toml`. Without that file the app uses Textual's default palette.
 
 ---
