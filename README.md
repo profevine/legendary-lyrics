@@ -4,7 +4,7 @@ Terminal music visualizer with album art, synced lyrics, Wikipedia trivia and ba
 
 ```
 ┌───────────────────────────────────────────────────────────────────────┐
-│                     ▶  Bohemian Rhapsody — Queen                      │
+│           ▶  Bohemian Rhapsody — Queen   [auto · spotify ▾]           │
 ├───────────────────────────────────────────────────────────────────────┤
 │ ╭──────────────────────╮ ╭──────────────────────────────────────────╮ │
 │ │                      │ │   Is this the real life?                 │ │
@@ -23,7 +23,7 @@ Terminal music visualizer with album art, synced lyrics, Wikipedia trivia and ba
 │ │  ▂▄█▆▃ ▁▅█▇▄▂ ▃▆█▅▁ ▂▇█▄▃▁ ▅█▆▂ ▁▃▇█▅▂ ▄█▃▁ ▂▆█▇▄▃ ▁▄█▅▂ ▃▇█▆▂▄▃▁ │ │
 │ ╰───────────────────────────────────────────────────────────────────╯ │
 │ 1:23 ▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 5:55          │
-│ space Play/Pause  n Next  p Prev  ←/→ ±5s  r Refresh  q Quit          │
+│ space Play/Pause  n Next  p Prev  ←/→ ±5s  s Player  r Refresh  q Quit│
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -32,6 +32,7 @@ Terminal music visualizer with album art, synced lyrics, Wikipedia trivia and ba
 - **Album art** — rendered with the Kitty graphics protocol on terminals that support it (detected by an active probe, not a hardcoded list, so `foot` and friends get full resolution too), falling back to high-resolution ANSI half-block art everywhere else. The panel is sized to the artwork's real aspect ratio and re-renders on terminal resize.
 - **Lyrics** from [lrclib.net](https://lrclib.net) — synced line-by-line with the current line highlighted, plain text when no LRC exists. The version whose duration matches the track is preferred, so a single edit or remaster doesn't leave synced lyrics drifting out of time.
 - **Playback controls** — play / pause, skip, and seek without leaving the app.
+- **Player picker** — click the title bar (or press `s`) to choose which player to follow, with each one's current track shown so you can tell a browser tab from your music player.
 - **Trivia panel** — Wikipedia background on the current album and artist, scrollable, below the art.
 - **Bar visualizer** — a full-width strip driven by `cava` when installed, or a built-in sine-wave simulation otherwise.
 - **Live playback sync** — progress bar, elapsed / total time and play / pause / stop icon, read from the player that is actually playing when several MPRIS players are registered.
@@ -107,6 +108,7 @@ legendary-lyrics
 | `n`     | Next track                                      |
 | `p`     | Previous track                                  |
 | `→` `←` | Seek forward / back 5 seconds                   |
+| `s`     | Choose which player to follow                    |
 | `r`     | Refetch this track's lyrics, art and trivia     |
 | `q`     | Quit                                            |
 
@@ -135,7 +137,7 @@ The trivia panel scrolls with the mouse wheel, or with `↑` `↓` / `PgUp` / `P
 - **No lyrics shown?** — the track may not be in lrclib.net's database. An exact lookup is tried first, then a fuzzy search ranked by how closely each version's duration matches what's playing.
 - **Lyrics out of sync?** — press `r`. That forgets the cached match and refetches, usually landing on a version with the right duration.
 - **Wrong track detected?** — make sure the media player exposes MPRIS. Run `legendary-lyrics --list-players` to see what's registered.
-- **Multiple players** — the one that's actually playing wins, and a real music track outranks a browser tab left on a video. Pin one with `--player spotify`.
+- **Multiple players** — the one that's actually playing wins, and a real music track outranks a browser tab left on a video. To override that, click the title bar (or press `s`) and pick from the list; the bar then reads `pinned` instead of `auto`. `--player spotify` pins one from the start.
 - **Trivia in your language** — `--lang pt` (any Wikipedia code); articles missing from that edition fall back to English.
 - **Colors look off?** — theme colors come from `~/.local/state/omarchy/current/theme/colors.toml`. Without that file the app uses Textual's default palette.
 

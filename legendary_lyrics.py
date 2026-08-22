@@ -162,11 +162,15 @@ def clear_cache() -> int:
 import httpx
 from PIL import Image
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
+from textual.message import Message
+from textual.screen import ModalScreen
 from textual.theme import Theme
-from textual.widgets import Static, Footer
+from textual.widgets import Footer, OptionList, Static
+from textual.widgets.option_list import Option
 
 
 # ─── playerctl ───────────────────────────────────────────────────────────────
@@ -863,6 +867,24 @@ class ArtWidget(Static):
 
         self.styles.height = disp_rows + 2  # + top/bottom border
 
+    def hide_kitty(self) -> None:
+        """Erase the Kitty image. Its pixels live outside the cell grid, so a
+        modal drawn over this area would otherwise show the art through it."""
+        if not (_kitty_supported() and self._img_data):
+            return
+        try:
+            with open('/dev/tty', 'wb') as tty_f:
+                tty_f.write(b'\x1b_Ga=d\x1b\\')
+        except Exception:
+            pass
+        self._last_size = (0, 0)   # force a repaint when it comes back
+
+    def repaint(self) -> None:
+        if _kitty_supported():
+            self._paint_kitty()
+        else:
+            self._paint_halfblock()
+
     def on_resize(self) -> None:
         # Debounce: cancel previous timer and restart, so we paint only after
         # the terminal finishes resizing (avoids mid-resize garbage frames).
@@ -1056,6 +1078,98 @@ class LyricsWidget(Static):
         self.update(text)
 
 
+class InfoBar(Static):
+    """The title bar. Clicking it opens the player picker."""
+
+    class Clicked(Message):
+        pass
+
+    def on_click(self) -> None:
+        self.post_message(self.Clicked())
+
+
+_AUTO = '@auto'
+
+
+class PlayerPicker(ModalScreen[Optional[str]]):
+    """Choose which MPRIS player to follow. Dismisses with the player's name,
+    an empty string for automatic selection, or None when cancelled."""
+
+    AUTO_FOCUS = '#picker-list'
+    BINDINGS = [('escape', 'cancel', 'Cancel')]
+
+    DEFAULT_CSS = """
+    PlayerPicker {
+        align: center middle;
+        background: $background 70%;
+    }
+    #picker {
+        width: 80%;
+        max-width: 76;
+        height: auto;
+        border: round $accent;
+        background: $panel;
+        padding: 1 2;
+    }
+    #picker-title {
+        text-style: bold;
+        padding-bottom: 1;
+    }
+    #picker-list {
+        height: auto;
+        max-height: 12;
+        background: $panel;
+        border: none;
+        padding: 0;
+    }
+    #picker-hint {
+        color: $foreground 50%;
+        padding-top: 1;
+    }
+    """
+
+    def __init__(self, players: list[dict], pinned: str):
+        super().__init__()
+        self._players = players
+        self._pinned = pinned
+
+    def _describe(self, player: dict) -> Text:
+        icon = {'Playing': '▶', 'Paused': '⏸'}.get(player['status'], '⏹')
+        marker = '● ' if player['player'] == self._pinned else '  '
+        text = Text(f"{marker}{icon} {player['player']}", style='bold')
+        title = player['title'] or '(nothing playing)'
+        artist = f" — {player['artist']}" if player['artist'] else ''
+        text.append(f'   {title}{artist}', style='dim')
+        return text
+
+    def compose(self) -> ComposeResult:
+        options = [Option(
+            Text('● ' if not self._pinned else '  ', style='bold').append(
+                'Auto', style='bold').append(
+                '   follow whichever player is playing', style='dim'),
+            id=_AUTO,
+        )]
+        options += [Option(self._describe(p), id=p['player'])
+                    for p in self._players]
+
+        with Vertical(id='picker'):
+            yield Static('Follow which player?', id='picker-title')
+            yield OptionList(*options, id='picker-list')
+            yield Static('enter select · esc cancel', id='picker-hint')
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        chosen = event.option.id or _AUTO
+        self.dismiss('' if chosen == _AUTO else chosen)
+
+    def on_click(self, event: events.Click) -> None:
+        # A click on the dimmed backdrop (rather than the panel) cancels.
+        if event.widget is self:
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # ─── main app ────────────────────────────────────────────────────────────────
 
 class LegendaryLyricsApp(App):
@@ -1084,6 +1198,7 @@ class LegendaryLyricsApp(App):
         ('p', 'prev_track', 'Prev'),
         ('left', 'seek_back', '-5s'),
         ('right', 'seek_forward', '+5s'),
+        ('s', 'choose_player', 'Player'),
         ('r', 'refresh', 'Refresh'),
         ('q', 'quit', 'Quit'),
     ]
@@ -1096,7 +1211,7 @@ class LegendaryLyricsApp(App):
         self._viz = Visualizer(n_bars=OPTS.bars)
 
     def compose(self) -> ComposeResult:
-        yield Static('Legendary Lyrics', id='info')
+        yield InfoBar('Legendary Lyrics', id='info')
         with Horizontal(id='columns'):
             with Vertical(id='left-col'):
                 yield ArtWidget(id='art')
@@ -1142,10 +1257,21 @@ class LegendaryLyricsApp(App):
         artist = track.get('artist') or ''
         sep = ' — ' if artist else ''
 
-        info = self._find('#info', Static)
+        info = self._find('#info', InfoBar)
         if info is None:
             return
-        info.update(f'{icon}  {title}{sep}{artist}')
+        label = Text(f'{icon}  {title}{sep}{artist}')
+        player = track.get('player', '')
+        if player:
+            mode = 'pinned' if OPTS.player else 'auto'
+            label.append(f'   [{mode} · {player} ▾]', style='' if OPTS.player else 'dim')
+        elif OPTS.player:
+            # Explains an otherwise baffling "Nothing playing": we're pinned to
+            # a player that isn't registered right now.
+            label.append(f'   [pinned · {OPTS.player} · not running ▾]', style='dim')
+        else:
+            label.append('   [choose player ▾]', style='dim')
+        info.update(label)
         self._update_progress()
 
         if song_changed:
@@ -1270,6 +1396,26 @@ class LegendaryLyricsApp(App):
 
     async def action_seek_back(self):
         await self._control('position', '5-')
+
+    async def on_info_bar_clicked(self, _: InfoBar.Clicked) -> None:
+        await self.action_choose_player()
+
+    async def action_choose_player(self) -> None:
+        players = await asyncio.to_thread(_players_snapshot)
+        art = self._find('#art', ArtWidget)
+        if art is not None:
+            art.hide_kitty()
+        self.push_screen(PlayerPicker(players, OPTS.player), self._player_chosen)
+
+    def _player_chosen(self, choice: Optional[str]) -> None:
+        art = self._find('#art', ArtWidget)
+        if art is not None:
+            art.repaint()
+        if choice is None:            # cancelled
+            return
+        OPTS.player = choice          # '' restores automatic selection
+        self._track = {}              # force a full refetch for the new player
+        self.call_later(self._poll)
 
     async def action_refresh(self):
         # A refresh should really refetch, so drop what we cached for this
