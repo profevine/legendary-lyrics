@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import base64
+import colorsys
 import hashlib
 import io
 import json
@@ -19,10 +20,11 @@ import tempfile
 import termios
 import time
 import tty
+from bisect import bisect_right
 from pathlib import Path
 from typing import Optional
 
-__version__ = '1.2.0'
+__version__ = '1.3.0'
 
 
 # ─── options ─────────────────────────────────────────────────────────────────
@@ -33,6 +35,7 @@ class Options:
     bars: int = 60          # visualizer bar count
     trivia: bool = True     # show the Wikipedia trivia panel
     cache: bool = True      # read/write the on-disk cache
+    karaoke: bool = True    # animate synced lyrics instead of listing them
     lang: str = 'en'        # Wikipedia language edition
 
 
@@ -160,7 +163,7 @@ def clear_cache() -> int:
     return removed
 
 import httpx
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
@@ -804,6 +807,456 @@ def _load_os_theme() -> Optional[Theme]:
         return None
 
 
+# ─── karaoke ─────────────────────────────────────────────────────────────────
+
+# Six stops sampled as a seamless loop, so a phase that only ever increases
+# walks the whole spectrum and wraps without a seam.
+_KARAOKE_PALETTE = (
+    (255, 92, 138),     # rose
+    (255, 168, 76),     # amber
+    (250, 233, 120),    # butter
+    (118, 238, 166),    # mint
+    (108, 196, 255),    # sky
+    (186, 148, 255),    # violet
+)
+
+# Off-stage lines are mixed towards this before being dimmed: the raw palette
+# on its own goes muddy once it is darkened, and lyrics have to stay readable.
+_QUIET_INK = (198, 205, 220)
+
+# Colour cycles per second, and how much of the palette one line spans.
+_PHASE_SPEED = 0.13
+_PHASE_SPREAD = 0.85
+
+# How long a line takes to materialise on stage, and the effects it can use.
+_ENTRY_SECONDS = 0.34
+_ENTRY_EFFECTS = ('expand', 'slide', 'decrypt', 'scatter')
+_DECRYPT_GLYPHS = '#%&@$*+=<>/\\|01'
+
+
+def _clamp01(x: float) -> float:
+    return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
+
+
+def _palette_rgb(t: float, palette: tuple = _KARAOKE_PALETTE) -> tuple[int, int, int]:
+    n = len(palette)
+    p = (t % 1.0) * n
+    i = int(p)
+    f = p - i
+    a, b = palette[i], palette[(i + 1) % n]
+    return (round(a[0] + (b[0] - a[0]) * f),
+            round(a[1] + (b[1] - a[1]) * f),
+            round(a[2] + (b[2] - a[2]) * f))
+
+
+def _mix(a: tuple[int, int, int], b: tuple[int, int, int],
+         t: float) -> tuple[int, int, int]:
+    return (round(a[0] + (b[0] - a[0]) * t),
+            round(a[1] + (b[1] - a[1]) * t),
+            round(a[2] + (b[2] - a[2]) * t))
+
+
+def _scale(color: tuple[int, int, int], k: float) -> tuple[int, int, int]:
+    return tuple(max(0, min(255, round(c * k))) for c in color)
+
+
+def _rgb(color: tuple[int, int, int], k: float = 1.0) -> str:
+    """A Rich colour, dimmed or brightened by k. Everything on the karaoke
+    stage is a true-colour value rather than a palette name, so a line can fade
+    smoothly instead of stepping between 'dim' and 'bold'."""
+    r, g, b = (max(0, min(255, round(c * k))) for c in color)
+    return f'rgb({r},{g},{b})'
+
+
+def _entry_alpha(effect: str, n: int, p: float, seed: int) -> list[float]:
+    """Per-character opacity while a line materialises, in the spirit of the
+    desktop screensaver's text effects."""
+    if p >= 1.0 or n == 0:
+        return [1.0] * n
+    if effect == 'expand':
+        centre = (n - 1) / 2
+        radius = p * (centre + 2.0)
+        return [_clamp01(radius - abs(i - centre) + 1.0) for i in range(n)]
+    if effect == 'scatter':
+        order = list(range(n))
+        random.Random(seed).shuffle(order)
+        rank = [0] * n
+        for place, i in enumerate(order):
+            rank[i] = place
+        front = p * (n + 4)
+        return [_clamp01(front - rank[i]) for i in range(n)]
+    front = p * (n + 6) - 3      # 'slide' and 'decrypt' both sweep left to right
+    return [_clamp01(front - i + 1.0) for i in range(n)]
+
+
+def _entry_chars(effect: str, chars: list[str], alpha: list[float],
+                 seed: int, frame: int) -> list[str]:
+    """Scramble whatever the entry effect has not settled yet."""
+    if effect != 'decrypt':
+        return chars
+    rnd = random.Random(seed * 7919 + frame)
+    return [c if a >= 1.0 or not c.strip() else rnd.choice(_DECRYPT_GLYPHS)
+            for c, a in zip(chars, alpha)]
+
+
+def _wrap_line(text: str, width: int) -> list[str]:
+    """Wrap on words so a long line stays readable when it is centred on the
+    stage; Rich's own wrapping cannot be used here because every row is
+    positioned by hand."""
+    if width <= 0 or len(text) <= width:
+        return [text]
+    out: list[str] = []
+    line = ''
+    for word in text.split(' '):
+        while len(word) > width:        # a single word wider than the panel
+            if line:
+                out.append(line)
+                line = ''
+            out.append(word[:width])
+            word = word[width:]
+        if not line:
+            line = word
+        elif len(line) + 1 + len(word) <= width:
+            line += ' ' + word
+        else:
+            out.append(line)
+            line = word
+    if line:
+        out.append(line)
+    return out
+
+
+# ─── big text ────────────────────────────────────────────────────────────────
+
+# A terminal cannot resize its own font, so the track title is rasterised with
+# PIL and painted as half-blocks — two roughly square pixels per cell, the same
+# trick the album art falls back to. Going through a real font is what lets the
+# banner carry accents, and anything else the system font covers, which a
+# hand-drawn block alphabet never would.
+_FONT_FALLBACKS = (
+    '/usr/share/fonts/liberation/LiberationSans-Bold.ttf',
+    '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
+    '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf',
+    '/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf',
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+    '/usr/share/fonts/noto/NotoSans-Bold.ttf',
+)
+
+# Below this the letters turn to mush and plain terminal text reads better.
+_MIN_TITLE_PX = 9
+
+# Fewest cells a rasterised lyric line may occupy before it is not worth it.
+_MIN_BIG_ROWS = 4
+
+# A title is nearly always limited by the width rather than the height, so one
+# size up is allowed to overflow this much and is then condensed back to fit —
+# which uses the rows we have instead of dropping to a smaller, blurrier size.
+_MAX_SQUEEZE = 0.8
+
+# Type set to the very limit of its box crowds everything around it, so the
+# size that fits is stepped back a fifth — never below what stays readable.
+_TYPE_SCALE = 0.8
+
+# Coverage is kept, not thresholded: a pixel only half covered by a stroke is
+# drawn as a blend of the ink and whatever is behind it, which is what stops
+# big type from breaking up into lego. These are the steps that blend is
+# quantised to, and the curve that keeps the result from going soft.
+_AA_LEVELS = 8
+_AA_GAMMA = 0.7
+
+# Columns that share one step of the gradient, and how many animation frames
+# pass between banner repaints.
+_HUE_STEP = 3
+_BANNER_EVERY = 3
+
+_UNPROBED = object()
+_font_path = _UNPROBED
+_big_cache: dict = {}
+_BIG_CACHE_MAX = 24
+
+
+def _info_rows(height: int) -> int:
+    """How many rows the title bar gets: enough for a banner on a roomy
+    terminal, and the single line it has always been when there is nothing to
+    spare."""
+    return max(3, min(8, height // 5))
+
+
+def _title_font() -> Optional[str]:
+    """A bold sans on disk. Asked of fontconfig first, since that is the only
+    thing that knows what this system actually has installed."""
+    global _font_path
+    if _font_path is _UNPROBED:
+        _font_path = None
+        try:
+            match = _run(['fc-match', '-f', '%{file}', 'sans-serif:bold'])
+            if match and Path(match).is_file():
+                _font_path = match
+        except Exception:
+            pass
+        if _font_path is None:
+            _font_path = next(
+                (p for p in _FONT_FALLBACKS if Path(p).is_file()), None)
+    return _font_path
+
+
+def _fit_font(path: str, parts: tuple, cols: int, height: int):
+    """The largest size at which every part fits the box, stepped back by
+    _TYPE_SCALE so the type has room to breathe, and allowing for the
+    condensing _draw_text does."""
+    for size in range(height + 6, _MIN_TITLE_PX - 1, -1):
+        font = ImageFont.truetype(path, size)
+        for text in parts:
+            left, top, right, bottom = font.getbbox(text)
+            if not (0 < bottom - top <= height
+                    and 0 < right - left <= cols / _MAX_SQUEEZE):
+                break
+        else:
+            eased = max(_MIN_TITLE_PX, round(size * _TYPE_SCALE))
+            return font if eased == size else ImageFont.truetype(path, eased)
+    return None     # even at the smallest readable size it does not fit
+
+
+def _ink_height(font, parts) -> int:
+    """A canvas exactly as tall as the tallest part's letters, rounded up to a
+    whole cell — anything more is dead space around the type."""
+    ink = max(font.getbbox(text)[3] - font.getbbox(text)[1] for text in parts)
+    return ink + ink % 2
+
+
+# Coverage 0-255 to one of _AA_LEVELS steps, gamma-corrected once here so the
+# paint loop only ever indexes a ramp.
+_COVERAGE = [round((v / 255) ** _AA_GAMMA * _AA_LEVELS) for v in range(256)]
+
+
+def _draw_text(font, text: str, cols: int, height: int) -> tuple:
+    """Rasterise one line centred in a cols x height canvas of half-cell
+    pixels. Returns the coverage grid and the columns its ink spans, which is
+    what a karaoke sweep needs to know to cut the line at the right place."""
+    left, top, right, bottom = font.getbbox(text)
+    w, h = right - left, bottom - top
+    img = Image.new('L', (w, h), 0)
+    # getbbox measures the ink, not the em box, so offsetting by it centres on
+    # the letters themselves rather than on the font's line spacing.
+    ImageDraw.Draw(img).text((-left, -top), text, font=font, fill=255)
+    if w > cols:
+        img = img.resize((cols, h), Image.LANCZOS)
+        w = cols
+    px = img.load()
+
+    grid = [[0] * cols for _ in range(height)]
+    ox, oy = (cols - w) // 2, (height - h) // 2
+    for y in range(h):
+        row = grid[y + oy]
+        for x in range(w):
+            row[x + ox] = _COVERAGE[px[x, y]]
+    return grid, ox, ox + w
+
+
+def _cached(key, build):
+    """Rasterising is far too slow to redo on every animation frame, and both
+    the title and the line being sung change only every few seconds."""
+    if key in _big_cache:
+        return _big_cache[key]
+    try:
+        value = build()
+    except Exception:
+        value = None    # an unreadable font file is not worth crashing over
+    if len(_big_cache) >= _BIG_CACHE_MAX:
+        _big_cache.clear()
+    _big_cache[key] = value
+    return value
+
+
+def _big_text(text: str, cols: int, rows: int) -> Optional[tuple]:
+    """Rasterise text as large as fits in cols x rows cells, centred both ways.
+    None when there is no font, or no room to draw it legibly."""
+    def build():
+        path = _title_font()
+        if not (path and text.strip() and cols > 0 and rows > 0):
+            return None
+        font = _fit_font(path, (text,), cols, rows * 2)
+        if font is None:
+            return None
+        return _draw_text(font, text, cols, _ink_height(font, (text,)))
+
+    return _cached(('text', text, cols, rows), build)
+
+
+def _split_evenly(text: str, parts: int) -> list:
+    """Break a line into `parts` pieces of roughly equal length, on word
+    boundaries. Empty when it cannot be split that many ways."""
+    if parts == 1:
+        return [text]
+    words = text.split()
+    if len(words) < parts:
+        return []
+    target = len(text) / parts
+    out: list = []
+    line = ''
+    for word in words:
+        if line and len(out) < parts - 1 and len(line) + 1 + len(word) > target:
+            out.append(line)
+            line = word
+        else:
+            line = f'{line} {word}' if line else word
+    if line:
+        out.append(line)
+    return out if len(out) == parts else []
+
+
+def _big_block(text: str, cols: int, rows: int) -> Optional[list]:
+    """Rasterise a lyric line over as many rows as it takes. Wrapping is tried
+    at one, two and three lines and the one that yields the largest type wins —
+    a line too wide to draw at any size in one piece is usually drawn much
+    bigger split in two. Every piece shares the winning size, so the line still
+    reads as one piece of type."""
+    def build():
+        path = _title_font()
+        if not (path and text.strip() and cols > 0 and rows > 0):
+            return None
+
+        best = None
+        for parts in (1, 2, 3):
+            per = rows // parts
+            if per < _MIN_BIG_ROWS:
+                break
+            segments = _split_evenly(text, parts)
+            if not segments:
+                continue
+            font = _fit_font(path, tuple(segments), cols, per * 2)
+            if font and (best is None or font.size > best[0].size):
+                best = (font, segments)
+        if best is None:
+            return None
+
+        font, segments = best
+        # One canvas height for every piece, so the gap between them stays even
+        # whether or not a piece happens to carry a descender.
+        height = _ink_height(font, segments)
+        return segments, [_draw_text(font, s, cols, height) for s in segments]
+
+    return _cached(('block', text, cols, rows), build)
+
+
+def _panel_rgb(widget) -> tuple:
+    """The colour actually behind a widget's content — what the half-covered
+    edge of a letter has to fade into."""
+    try:
+        return widget.background_colors[1].rgb
+    except Exception:
+        return (12, 12, 16)
+
+
+# Ramps are keyed on the ink rounded to a 32nd of each channel: the gradient
+# drifts far too slowly for that to be visible, and it makes consecutive frames
+# ask for the same ramp instead of building a new one 27 times a frame.
+_RAMPS: dict = {}
+_RAMP_CACHE_MAX = 4096
+
+
+def _ramp(back: tuple, ink: tuple) -> tuple:
+    """What a stroke of `ink` looks like at each coverage level once blended
+    into the colour behind it, plus a memo of the composed cell styles. Painting
+    a cell is then a dict lookup rather than two blends and a format."""
+    key = (back, ink[0] & 0xF8, ink[1] & 0xF8, ink[2] & 0xF8)
+    ramp = _RAMPS.get(key)
+    if ramp is None:
+        if len(_RAMPS) >= _RAMP_CACHE_MAX:
+            _RAMPS.clear()
+        ramp = _RAMPS[key] = ([_rgb(_mix(back, key[1:], i / _AA_LEVELS))
+                               for i in range(_AA_LEVELS + 1)], {})
+    return ramp
+
+
+def _paint_row(top: list, bottom: list, width: int, ramps: list,
+               alpha: Optional[list] = None) -> Text:
+    """One row of a rasterised grid. Every inked cell is a ▀ whose foreground
+    is the top half-pixel and whose background is the bottom one, so a cell can
+    carry two different coverages; runs that share a style collapse into a
+    single span."""
+    line = Text(no_wrap=True)
+    run, style, blanks = '', '', 0
+    for x in range(width):
+        ramp = ramps[x]
+        up, down = top[x], bottom[x]
+        if ramp is None or not (up or down):
+            blanks += 1
+            continue
+        if alpha is not None:               # a line still materialising
+            fade = alpha[x]
+            up, down = round(up * fade), round(down * fade)
+            if not (up or down):
+                blanks += 1
+                continue
+        colours, memo = ramp
+        here = memo.get((up, down))
+        if here is None:
+            here = memo[(up, down)] = f'{colours[up]} on {colours[down]}'
+        if blanks or here != style:
+            if run:
+                line.append(run, style=style)
+            line.append(' ' * blanks)
+            run, style, blanks = '', here, 0
+        run += '▀'
+    if run:
+        line.append(run, style=style)
+    return line
+
+
+def _hsv_rgb(hue: float, sat: float, val: float) -> tuple[int, int, int]:
+    return tuple(round(c * 255)
+                 for c in colorsys.hsv_to_rgb(hue % 1.0, min(1.0, max(0.0, sat)),
+                                              min(1.0, max(0.0, val))))
+
+
+# What a cover with no colour in it at all lends the title instead.
+_SILVER = ((238, 242, 250), (166, 176, 196), (216, 222, 234), (134, 145, 166))
+
+
+def _cover_palette(data: bytes) -> Optional[tuple]:
+    """The vivid colours of an album cover, ordered around the colour wheel so
+    a gradient running through them sweeps rather than lurches. Near-greys are
+    dropped — they have nothing to lend, and a title painted in them would look
+    broken rather than tasteful."""
+    try:
+        img = Image.open(io.BytesIO(data)).convert('RGB')
+        img.thumbnail((80, 80))
+        quantised = img.quantize(colors=24)
+        table = quantised.getpalette() or []
+        counts = quantised.getcolors() or []
+    except Exception:
+        return None     # not an image we can read; keep the built-in gradient
+
+    picks: list = []
+    for _, index in sorted(counts, reverse=True):
+        r, g, b = table[index * 3:index * 3 + 3]
+        hue, sat, val = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+        if sat < 0.15 or val < 0.2:
+            continue
+        # A cover often quantises into a dozen shades of one colour; keeping
+        # them all would make a "gradient" that never actually changes.
+        if any(min(abs(hue - h), 1 - abs(hue - h)) < 0.05 for h, _, _ in picks):
+            continue
+        picks.append((hue, sat, val))
+        if len(picks) == 6:
+            break
+
+    if not picks:
+        return _SILVER
+    if len(picks) < 3:
+        # One colour on the cover still makes a gradient, just a tonal one.
+        hue, sat, val = picks[0]
+        sat, val = min(0.85, max(0.5, sat)), min(1.0, max(0.75, val))
+        return tuple(_hsv_rgb(hue + d, sat * s, val * v) for d, s, v in
+                     ((-0.05, 0.75, 1.0), (0.0, 1.0, 0.86),
+                      (0.05, 0.8, 1.0), (0.0, 0.9, 0.78)))
+
+    picks.sort()
+    return tuple(_hsv_rgb(hue, min(0.85, max(0.5, sat)), min(1.0, max(0.75, val)))
+                 for hue, sat, val in picks)
+
+
 # ─── widgets ─────────────────────────────────────────────────────────────────
 
 _EIGHTH_BLOCKS = ' ▁▂▃▄▅▆▇█'
@@ -1072,6 +1525,10 @@ class TriviaWidget(VerticalScroll):
 
 
 class LyricsWidget(Static):
+    """Lyrics, either as a plain scrolling list or — when the track came with
+    timestamps — as a karaoke stage: the line being sung sits in the middle of
+    the panel, swept character by character in time with the music."""
+
     DEFAULT_CSS = """
     LyricsWidget {
         width: 1fr;
@@ -1082,26 +1539,295 @@ class LyricsWidget(Static):
     }
     """
 
+    # A cue only says when a line starts, so the sweep runs at roughly singing
+    # speed instead of being stretched across a trailing instrumental.
+    _WIPE_MIN = 1.2
+    _WIPE_PER_CHAR = 0.28
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._lines: list[str] = []
-        self._current: int = -1
+        self._lines: list[str] = []                  # unsynced lyrics
+        self._entries: list[tuple[float, str]] = []  # synced lyrics
+        self._times: list[float] = []
+        self._pos = 0.0
+        self._energy = 0.0
+        self._stage_index = -1
+        self._stage_since = 0.0
+        self._frame = 0
 
-    def set_lyrics(self, lines: list[str], current: int = -1):
+    # ── what to show ────────────────────────────────────────────────────────
+
+    def set_synced(self, entries: list[tuple[float, str]]) -> None:
+        self._lines = []
+        self._entries = entries
+        self._times = [t for t, _ in entries]
+        self._stage_index = -1
+        self._draw()
+
+    def set_plain(self, lines: list[str]) -> None:
+        self._entries = []
+        self._times = []
         self._lines = lines
-        self._current = current
+        self._draw()
+
+    def clear(self) -> None:
+        self._lines = []
+        self._entries = []
+        self._times = []
+        self._stage_index = -1
+        self._draw()
+
+    def tick(self, position: float, energy: float) -> None:
+        """Called on every animation frame with the interpolated playback
+        position and how loud the music is right now."""
+        self._pos = position
+        self._energy = energy
+        self._frame += 1
+        if not self._entries:
+            return
+        if OPTS.karaoke:
+            self._draw()
+        elif self._stage(position)[0] != self._stage_index:
+            self._draw()
+
+    def relayout(self) -> None:
         self._draw()
 
     def on_resize(self) -> None:
         self.call_later(self._draw)
 
+    # ── drawing ─────────────────────────────────────────────────────────────
+
     def _draw(self) -> None:
-        lines, current = self._lines, self._current
-
-        if not lines:
+        if self._entries:
+            stage, sung, wait = self._stage(self._pos)
+            if OPTS.karaoke:
+                width = max(8, self.content_size.width)
+                height = max(3, self.content_size.height)
+                self.update(self._render_stage(width, height, stage, sung, wait))
+            else:
+                self.update(self._render_list([s for _, s in self._entries], stage))
+        elif self._lines:
+            self.update(self._render_list(self._lines, -1))
+        else:
             self.update(Text('Lyrics not found', style='dim italic'))
-            return
 
+    def _stage(self, pos: float) -> tuple[int, float, Optional[float]]:
+        """Which line is on stage, how much of it has been sung (0-1), and how
+        long until the next one when we are waiting through an instrumental."""
+        entries, times = self._entries, self._times
+        i = bisect_right(times, pos) - 1
+
+        nxt = None
+        for j in range(max(0, i + 1), len(entries)):
+            if times[j] > pos and entries[j][1].strip():
+                nxt = j
+                break
+
+        # Before the first cue, or parked on one of the blank cues an LRC file
+        # uses to mark an instrumental: put the upcoming line on stage early so
+        # there is something to read before it has to be sung.
+        if i < 0 or not entries[i][1].strip():
+            if nxt is not None:
+                return nxt, 0.0, times[nxt] - pos
+            while i >= 0 and not entries[i][1].strip():
+                i -= 1
+            return i, 1.0, None
+
+        start = times[i]
+        span = times[i + 1] - start if i + 1 < len(times) else 6.0
+        dur = max(self._WIPE_MIN,
+                  min(span, self._WIPE_PER_CHAR * len(entries[i][1].strip()) + 0.8))
+        sung = _clamp01((pos - start) / dur)
+
+        wait = None
+        if sung >= 1.0 and nxt is not None and times[nxt] - (start + dur) >= 3.0:
+            wait = times[nxt] - pos
+        return i, sung, wait
+
+    def _render_stage(self, width: int, height: int, stage: int,
+                      sung: float, wait: Optional[float]) -> Text:
+        now = time.monotonic()
+        phase = now * _PHASE_SPEED
+        # Taller panels get more air between the lines, which is what makes the
+        # sung line read as zoomed in rather than as one row among many.
+        gap = sum(height >= tier for tier in (13, 26, 38))
+
+        if stage != self._stage_index:
+            self._stage_index = stage
+            self._stage_since = now
+        entering = _clamp01((now - self._stage_since) / _ENTRY_SECONDS)
+
+        rows: list[Text] = []
+        if stage >= 0:
+            rows = self._active_rows(self._entries[stage][1].strip(), width,
+                                     height, sung, entering, stage, phase)
+        if wait is not None and wait <= 4.0:
+            rows = ([self._pips(wait, width, phase)]
+                    + ([Text()] if gap else []) + rows)
+
+        above: list[Text] = []
+        j, dist = stage - 1, 1
+        while j >= 0 and len(above) < height:
+            line = self._entries[j][1].strip()
+            if line:
+                above = (self._quiet_rows(line, width, dist, phase)
+                         + [Text()] * gap + above)
+                dist += 1
+            j -= 1
+
+        below: list[Text] = []
+        j, dist = stage + 1, 1
+        while j < len(self._entries) and len(below) < height:
+            line = self._entries[j][1].strip()
+            if line:
+                below = (below + [Text()] * gap
+                         + self._quiet_rows(line, width, dist, phase))
+                dist += 1
+            j += 1
+
+        top = max(0, (height - len(rows)) // 2)
+        above = above[-top:] if top else []
+        out = [Text()] * (top - len(above)) + above + rows + below
+
+        text = Text(no_wrap=True)
+        for k, row in enumerate(out[:height]):
+            if k:
+                text.append('\n')
+            text.append_text(row)
+        return text
+
+    def _active_rows(self, line: str, width: int, height: int, sung: float,
+                     entering: float, seed: int, phase: float) -> list[Text]:
+        """The line being sung, drawn as large as the panel allows. Falling
+        back to ordinary terminal text keeps a narrow or short panel — or a
+        machine with no font to rasterise from — working as it always did."""
+        # Leave the stage half the panel at most, so the lines around it still
+        # have somewhere to sit.
+        budget = max(_MIN_BIG_ROWS, min(height - 4, height // 2))
+        big = _big_block(line, width, budget)
+        if big is None:
+            return self._text_rows(line, width, sung, entering, seed, phase)
+        return self._raster_rows(*big, width, sung, entering, seed, phase)
+
+    def _raster_rows(self, segments: list, pieces: list, width: int,
+                     sung: float, entering: float, seed: int,
+                     phase: float) -> list[Text]:
+        total = sum(len(s) for s in segments)
+        glow = 1.0 + 0.22 * self._energy    # the sung text breathes with the music
+        effect = _ENTRY_EFFECTS[seed % len(_ENTRY_EFFECTS)]
+        back = _panel_rgb(self)
+        pale = _ramp(back, (198, 206, 222))
+
+        rows: list[Text] = []
+        consumed = 0
+        for segment, (grid, x0, x1) in zip(segments, pieces):
+            span = max(1, x1 - x0)
+            # The sweep runs over pixels rather than characters, so it can cut
+            # a letter in half the way a karaoke wipe is supposed to.
+            cut = x0 + span * _clamp01((sung * total - consumed) / len(segment))
+            consumed += len(segment)
+            drift = _HUE_STEP * _PHASE_SPREAD / span
+            sungs = [_ramp(back, _scale(_palette_rgb(phase + i * drift), glow))
+                     for i in range(span // _HUE_STEP + 1)]
+            ramps: list = []
+            for x in range(width):
+                if not x0 <= x < x1:
+                    ramps.append(None)
+                else:
+                    ramps.append(sungs[(x - x0) // _HUE_STEP]
+                                 if x < cut else pale)
+
+            # A line arriving on stage thins out rather than dimming: fading the
+            # coverage keeps the anti-aliasing doing the work.
+            fade = None
+            if entering < 1.0:
+                arriving = _entry_alpha(effect, span, entering, seed)
+                fade = [arriving[x - x0] if x0 <= x < x1 else 0.0
+                        for x in range(width)]
+
+            if rows:
+                rows.append(Text())         # air between the halves of a line
+            for r in range(len(grid) // 2):
+                rows.append(_paint_row(grid[r * 2], grid[r * 2 + 1], width,
+                                       ramps, fade))
+        return rows
+
+    def _text_rows(self, line: str, width: int, sung: float, entering: float,
+                   seed: int, phase: float) -> list[Text]:
+        segments = _wrap_line(line, width)
+        total = sum(len(s) for s in segments)
+        if not total:
+            return []
+
+        # Zoom: a short line on a wide panel is letter-spaced so it fills the
+        # stage instead of sitting small in the middle of it.
+        step = min(2, width // total) if len(segments) == 1 else 1
+        spread = step > 1
+
+        effect = _ENTRY_EFFECTS[seed % len(_ENTRY_EFFECTS)]
+        alpha = _entry_alpha(effect, total, entering, seed)
+        chars = _entry_chars(effect, list(''.join(segments)), alpha,
+                             seed, self._frame // 2)
+
+        head = int(sung * total)
+        glow = 1.0 + 0.22 * self._energy    # the sung text breathes with the music
+
+        rows: list[Text] = []
+        offset = 0
+        for segment in segments:
+            body = Text(no_wrap=True)
+            for c in range(len(segment)):
+                i = offset + c
+                char, a = chars[i], alpha[i]
+                if a <= 0.04 or not char.strip():
+                    body.append(' ' * step)
+                    continue
+                if i < head:
+                    hue = _palette_rgb(phase + i * _PHASE_SPREAD / total)
+                    style = f'bold {_rgb(hue, glow * (0.45 + 0.55 * a))}'
+                elif i == head:
+                    style = f'bold {_rgb((255, 255, 255), 0.55 + 0.45 * a)}'
+                else:
+                    style = _rgb((190, 198, 215), 0.42 + 0.58 * a)
+                body.append(char, style=style)
+                if spread:
+                    body.append(' ' * (step - 1))
+            pad = max(0, (width - len(segment) * step) // 2)
+            row = Text(' ' * pad, no_wrap=True)
+            row.append_text(body)
+            rows.append(row)
+            offset += len(segment)
+        return rows
+
+    def _quiet_rows(self, line: str, width: int, dist: int,
+                    phase: float) -> list[Text]:
+        """A line that is not being sung: still tinted from the same gradient,
+        but fading out the further it is from the stage."""
+        style = _rgb(_mix(_palette_rgb(phase - 0.05 * dist), _QUIET_INK, 0.55),
+                     max(0.40, 0.86 - 0.15 * dist))
+        rows = []
+        for segment in _wrap_line(line, width):
+            pad = max(0, (width - len(segment)) // 2)
+            rows.append(Text(' ' * pad + segment, style=style, no_wrap=True))
+        return rows
+
+    def _pips(self, wait: float, width: int, phase: float) -> Text:
+        """The four-beat count-in before a line comes back after a gap."""
+        lit = max(0, min(4, 4 - math.ceil(wait)))
+        row = Text(' ' * max(0, (width - 7) // 2), no_wrap=True)
+        for i in range(4):
+            if i:
+                row.append(' ')
+            if i < lit:
+                row.append('●', style=f'bold {_rgb(_palette_rgb(phase + i * 0.08))}')
+            else:
+                row.append('○', style=_rgb((120, 128, 148), 0.7))
+        return row
+
+    def _render_list(self, lines: list[str], current: int) -> Text:
+        """The plain view: used for unsynced lyrics, and for synced ones when
+        the animation is switched off."""
         rows = self.content_size.height or 24
         window = max(10, rows - 2)
 
@@ -1123,17 +1849,112 @@ class LyricsWidget(Static):
                 text.append(f'  {stripped}\n')
             else:
                 text.append(f'  {stripped}\n', style='dim')
-        self.update(text)
+        return text
 
 
 class InfoBar(Static):
-    """The title bar. Clicking it opens the player picker."""
+    """The title bar. The track title is drawn as large as the terminal has
+    room for, centred in both directions, with the artist and the player on a
+    line of their own beneath it. Clicking anywhere on it opens the picker."""
 
     class Clicked(Message):
         pass
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._icon = ''
+        self._title = 'Legendary Lyrics'
+        self._artist = ''
+        self._chip = Text()
+        self._animated = False
+        self._term_height = 0
+        self._frame = 0
+        self._palette = _KARAOKE_PALETTE
+
     def on_click(self) -> None:
         self.post_message(self.Clicked())
+
+    def show(self, icon: str, title: str, artist: str, chip: Text) -> None:
+        self._icon = icon
+        self._title = title
+        self._artist = artist
+        self._chip = chip
+        self._draw()
+
+    def set_palette(self, palette: Optional[tuple]) -> None:
+        """Paint the banner in the album cover's own colours; None goes back
+        to the built-in gradient."""
+        self._palette = palette or _KARAOKE_PALETTE
+        self._draw()
+
+    def tick(self) -> None:
+        """Drift the banner's gradient — only while there is one to drift, and
+        at a third of the frame rate, which a colour this slow cannot tell from
+        the full one and which keeps a wide banner off the CPU."""
+        self._frame += 1
+        if self._animated and self._frame % _BANNER_EVERY == 0:
+            self._draw()
+
+    def relayout(self, terminal_height: int = 0) -> None:
+        """The banner is sized from the whole terminal, not from this widget,
+        so the app pushes the new height in — a Resize event carries it before
+        app.size has caught up with it."""
+        if terminal_height:
+            self._term_height = terminal_height
+        self._draw()
+
+    def on_resize(self) -> None:
+        self.call_later(self._draw)
+
+    def _draw(self) -> None:
+        width = self.content_size.width
+        if not width:
+            return      # no layout yet; the resize that follows will draw us
+
+        rows = _info_rows(self._term_height or self.app.size.height)
+        big = _big_text(self._title, width, rows - 1) if rows >= 4 else None
+        self._animated = big is not None and OPTS.karaoke
+
+        if big is None:
+            line = Text(f'{self._icon}  {self._title}', no_wrap=True)
+            if self._artist:
+                line.append(f' — {self._artist}')
+            line.append_text(self._chip)
+            lines = [Text(), self._centre(line, width), Text()]
+        else:
+            phase = time.monotonic() * _PHASE_SPEED * 0.5 if self._animated else 0.0
+            lines = self._banner(big[0], width, phase)
+            sub = Text(f'{self._icon}  {self._artist}'.rstrip(), no_wrap=True)
+            sub.append_text(self._chip)
+            lines.append(self._centre(sub, width))
+
+        text = Text(no_wrap=True)
+        for i, line in enumerate(lines):
+            if i:
+                text.append('\n')
+            text.append_text(line)
+        self.update(text)
+
+    def _banner(self, grid: list, width: int, phase: float) -> list:
+        """Paint the rasterised title in the cover's colours."""
+        back = _panel_rgb(self)
+        spread = _HUE_STEP * 0.55 / width
+        lines = []
+        for r in range(len(grid) // 2):
+            drift = phase + r * 0.04
+            # One gradient step every few columns, so whole runs of cells share
+            # a ramp instead of each carrying its own.
+            groups = [_ramp(back, _palette_rgb(drift + i * spread, self._palette))
+                      for i in range(width // _HUE_STEP + 1)]
+            ramps = [groups[x // _HUE_STEP] for x in range(width)]
+            lines.append(_paint_row(grid[r * 2], grid[r * 2 + 1], width, ramps))
+        return lines
+
+    @staticmethod
+    def _centre(line: Text, width: int) -> Text:
+        out = Text(' ' * max(0, (width - line.cell_len) // 2), no_wrap=True)
+        out.append_text(line)
+        return out
 
 
 _AUTO = '@auto'
@@ -1226,8 +2047,8 @@ class LegendaryLyricsApp(App):
     Screen { background: $background; }
 
     #info {
-        height: 3;
-        content-align: center middle;
+        height: auto;
+        padding: 0 1;
         background: $panel;
         border-bottom: solid $accent;
         text-style: bold;
@@ -1247,6 +2068,7 @@ class LegendaryLyricsApp(App):
         ('left', 'seek_back', '-5s'),
         ('right', 'seek_forward', '+5s'),
         ('s', 'choose_player', 'Player'),
+        ('k', 'toggle_karaoke', 'Karaoke'),
         ('r', 'refresh', 'Refresh'),
         ('q', 'quit', 'Quit'),
     ]
@@ -1254,12 +2076,14 @@ class LegendaryLyricsApp(App):
     def __init__(self):
         super().__init__()
         self._track: dict = {}
-        self._lrc: list[tuple[float, str]] = []
-        self._plain: list[str] = []
+        # When the position in _track was read. playerctl is only polled once a
+        # second; the karaoke sweep and the progress bar interpolate from here
+        # so they move smoothly between polls instead of jumping.
+        self._pos_at: float = time.monotonic()
         self._viz = Visualizer(n_bars=OPTS.bars)
 
     def compose(self) -> ComposeResult:
-        yield InfoBar('Legendary Lyrics', id='info')
+        yield InfoBar(id='info')
         with Horizontal(id='columns'):
             with Vertical(id='left-col'):
                 yield ArtWidget(id='art')
@@ -1277,8 +2101,8 @@ class LegendaryLyricsApp(App):
             self.theme = 'omarchy'
         await self._viz.start()
         self.set_interval(1.0, self._poll)
-        self.set_interval(0.5, self._sync_lrc)
-        self.set_interval(1 / 20, self._tick_viz)
+        self.set_interval(0.25, self._update_progress)
+        self.set_interval(1 / 20, self._tick)
         await self._poll()
 
     def _find(self, selector: str, kind):
@@ -1292,6 +2116,7 @@ class LegendaryLyricsApp(App):
 
     async def _poll(self):
         track = await asyncio.to_thread(get_track)
+        self._pos_at = time.monotonic()
 
         song_changed = (
             track.get('title') != self._track.get('title') or
@@ -1303,30 +2128,27 @@ class LegendaryLyricsApp(App):
         icon = {'Playing': '▶', 'Paused': '⏸', 'Stopped': '⏹'}.get(status, '⏹')
         title = track.get('title') or 'Nothing playing'
         artist = track.get('artist') or ''
-        sep = ' — ' if artist else ''
 
         self._viz.active = status == 'Playing'
         info = self._find('#info', InfoBar)
         if info is None:
             return
-        label = Text(f'{icon}  {title}{sep}{artist}')
+        chip = Text()
         player = track.get('player', '')
         if player:
             mode = 'pinned' if OPTS.player else 'auto'
-            label.append(f'   [{mode} · {player} ▾]', style='' if OPTS.player else 'dim')
+            chip.append(f'   [{mode} · {player} ▾]', style='' if OPTS.player else 'dim')
         elif OPTS.player:
             # Explains an otherwise baffling "Nothing playing": we're pinned to
             # a player that isn't registered right now.
-            label.append(f'   [pinned · {OPTS.player} · not running ▾]', style='dim')
+            chip.append(f'   [pinned · {OPTS.player} · not running ▾]', style='dim')
         else:
-            label.append('   [choose player ▾]', style='dim')
-        info.update(label)
+            chip.append('   [choose player ▾]', style='dim')
+        info.show(icon, title, artist, chip)
         self._update_progress()
 
         if song_changed:
-            self._lrc = []
-            self._plain = []
-            self._set_lyrics([])
+            self._clear_lyrics()
             self._set_trivia('', '', '', '')
 
             art_task = asyncio.create_task(fetch_art_bytes(
@@ -1350,6 +2172,13 @@ class LegendaryLyricsApp(App):
             art = self._find('#art', ArtWidget)
             if art is not None:
                 art.set_image_data(art_data)
+            # Quantising the cover is heavy enough to stutter the animation if
+            # it runs on the event loop.
+            palette = (await asyncio.to_thread(_cover_palette, art_data)
+                       if art_data else None)
+            info = self._find('#info', InfoBar)
+            if info is not None:
+                info.set_palette(palette)
             self._set_trivia(
                 track.get('album', ''), track.get('artist', ''), album_text, artist_text
             )
@@ -1357,33 +2186,29 @@ class LegendaryLyricsApp(App):
             synced = lyrics_data.get('syncedLyrics', '')
             plain = lyrics_data.get('plainLyrics', '')
 
+            lyrics = self._find('#lyrics', LyricsWidget)
+            if lyrics is None:
+                return
             if synced:
-                self._lrc = _parse_lrc(synced)
-                self._plain = []
-                self._sync_lrc()
+                lyrics.set_synced(_parse_lrc(synced))
             elif plain:
-                self._lrc = []
-                self._plain = plain.splitlines()
-                self._set_lyrics(self._plain)
+                lyrics.set_plain(plain.splitlines())
             else:
-                self._set_lyrics([])
+                lyrics.clear()
 
-    def _sync_lrc(self):
-        if not self._lrc:
-            return
+    def _position(self) -> float:
+        """Where the track is right now, not where it was at the last poll."""
         pos = self._track.get('position', 0.0)
-        idx = 0
-        for i, (t, _) in enumerate(self._lrc):
-            if t <= pos:
-                idx = i
-        lines = [ln for _, ln in self._lrc]
-        self._set_lyrics(lines, idx)
+        if self._track.get('status') == 'Playing':
+            pos += max(0.0, time.monotonic() - self._pos_at)
+        length = self._track.get('length', 0.0)
+        return min(pos, length) if length > 0 else pos
 
     def _update_progress(self):
         progress = self._find('#progress', Static)
         if progress is None:
             return
-        pos = self._track.get('position', 0.0)
+        pos = self._position()
         length = self._track.get('length', 0.0)
         if length <= 0:
             progress.update('')
@@ -1396,13 +2221,20 @@ class LegendaryLyricsApp(App):
         m2, s2 = divmod(int(length), 60)
         progress.update(f'{m1}:{s1:02d} {bar} {m2}:{s2:02d}')
 
-    def _tick_viz(self):
+    def _tick(self):
+        heights = self._viz.heights
         viz = self._find('#viz', VizWidget)
-        if viz is None:
-            return
-        if viz.border_title != self._viz.source:
-            viz.border_title = self._viz.source
-        viz.render_bars(self._viz.heights)
+        if viz is not None:
+            if viz.border_title != self._viz.source:
+                viz.border_title = self._viz.source
+            viz.render_bars(heights)
+        lyrics = self._find('#lyrics', LyricsWidget)
+        if lyrics is not None:
+            energy = max(heights) if heights else 0.0
+            lyrics.tick(self._position(), energy)
+        info = self._find('#info', InfoBar)
+        if info is not None:
+            info.tick()
 
     async def on_unmount(self):
         await self._viz.stop()
@@ -1413,10 +2245,10 @@ class LegendaryLyricsApp(App):
     async def action_quit(self):
         self.exit()
 
-    def _set_lyrics(self, lines: list[str], current: int = -1) -> None:
+    def _clear_lyrics(self) -> None:
         widget = self._find('#lyrics', LyricsWidget)
         if widget is not None:
-            widget.set_lyrics(lines, current)
+            widget.clear()
 
     def _set_trivia(self, album: str, artist: str,
                     album_text: str, artist_text: str) -> None:
@@ -1472,6 +2304,20 @@ class LegendaryLyricsApp(App):
         self._track = {}              # force a full refetch for the new player
         self.call_later(self._poll)
 
+    def on_resize(self, event: events.Resize) -> None:
+        # How tall the title banner may be comes from the whole terminal, which
+        # the title bar cannot see a change in on its own.
+        info = self._find('#info', InfoBar)
+        if info is not None:
+            info.relayout(event.size.height)
+
+    def action_toggle_karaoke(self) -> None:
+        OPTS.karaoke = not OPTS.karaoke
+        for selector, kind in (('#lyrics', LyricsWidget), ('#info', InfoBar)):
+            widget = self._find(selector, kind)
+            if widget is not None:
+                widget.relayout()
+
     async def action_refresh(self):
         # A refresh should really refetch, so drop what we cached for this
         # track first — otherwise 'r' just replays the same wrong match.
@@ -1516,6 +2362,11 @@ def main() -> int:
         help='hide the trivia panel and give the album art the whole column',
     )
     parser.add_argument(
+        '--no-karaoke', action='store_true',
+        help='show synced lyrics as a plain list instead of the animated '
+             'sing-along stage',
+    )
+    parser.add_argument(
         '--no-cache', action='store_true',
         help='never read or write the on-disk cache',
     )
@@ -1541,6 +2392,7 @@ def main() -> int:
     OPTS.bars = max(8, min(256, args.bars))
     OPTS.trivia = not args.no_trivia
     OPTS.cache = not args.no_cache
+    OPTS.karaoke = not args.no_karaoke
     OPTS.lang = args.lang
 
     if args.list_players:
@@ -1558,6 +2410,7 @@ def main() -> int:
     # escape-sequence responses, so queries done after start-up are unreliable.
     _kitty_supported()
     _get_cell_size()
+    _title_font()
     LegendaryLyricsApp().run()
     return 0
 
