@@ -5,34 +5,41 @@ background on what you're hearing, and playback controls — for whatever is
 already playing on your machine.
 
 ```
-┌───────────────────────────────────────────────────────────────────────┐
-│           ▶  Bohemian Rhapsody — Queen   [auto · spotify ▾]           │
-├───────────────────────────────────────────────────────────────────────┤
-│ ╭──────────────────────╮ ╭──────────────────────────────────────────╮ │
-│ │                      │ │   Is this the real life?                 │ │
-│ │   album art, drawn   │ │   Is this just fantasy?                  │ │
-│ │   with the Kitty     │ │ ▶ Caught in a landslide                  │ │
-│ │   graphics protocol  │ │   No escape from reality                 │ │
-│ │   or half-blocks     │ │   Open your eyes                         │ │
-│ ╰──────────────────────╯ │   Look up to the skies and see           │ │
-│ ╭──────────────────────╮ │                                          │ │
-│ │ A Night at the Opera │ │   I'm just a poor boy, I need no…        │ │
-│ │ …fourth studio album │ │                                          │ │
-│ │ Queen                │ │                                          │ │
-│ │ …British rock band   │ │                                          │ │
-│ ╰──────────────────────╯ ╰──────────────────────────────────────────╯ │
-│ ╭─ cava ────────────────────────────────────────────────────────────╮ │
-│ │  ▂▄█▆▃ ▁▅█▇▄▂ ▃▆█▅▁ ▂▇█▄▃▁ ▅█▆▂ ▁▃▇█▅▂ ▄█▃▁ ▂▆█▇▄▃ ▁▄█▅▂ ▃▇█▆▂▄▃▁ │ │
-│ ╰───────────────────────────────────────────────────────────────────╯ │
-│ 1:23 ▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 5:55          │
-│ space Play/Pause  n Next  p Prev  ←/→ ±5s  s Player  r Refresh  q Quit│
-└───────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────────────────────┐
+│   ██▀▀█▄      ██                 ▀▀             ██▀▀██ ██                           ██         │
+│   ██▄▄█▀ ▄█▀████▀██ ▄█▀█▄██▀██▀█▄██ ▀▀█▄██▀██   ██▄▄█▀ ██▀██ ▀▀█▄██▀██ ▄█▀▀ ▄█▀██▄█▀██ ██ ██   │
+│   ██  ██ ██ ▄███  █ ██▀▀▀██ ██ ████▄█▀████  █   ██ ▀█▄ ██  █▄█▀████ ▄█  ▀▀█▄██ ▄███ ██  █▄█    │
+│   ▀▀▀▀▀▀  ▀▀▀ ▀▀  ▀  ▀▀▀ ▀▀ ▀▀ ▀▀▀▀▀▀▀▀▀▀▀  ▀   ▀▀  ▀▀ ▀▀  ▀▀▀▀▀▀██▀▀▀  ▀▀▀  ▀▀▀  ▀▀▀▀   █▀    │
+│                                                                  ▀▀                    ▀▀▀     │
+│                                 ▶  Queen   [auto · spotify ▾]                                  │
+├────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ ╭────────────────────────────╮ ╭─────────────────────────────────────────────────────────────╮ │
+│ │                            │ │                    Is this the real life?                   │ │
+│ │   album art, drawn         │ │                                                             │ │
+│ │   with the Kitty           │ │                    Is this just fantasy?                    │ │
+│ │   graphics protocol        │ │                                                             │ │
+│ │   or half-blocks           │ │ █▀▀█▄                                                       │ │
+│ ╰────────────────────────────╯ │██  ████▀██ █▀█▄██▀█▄  ▀█ ██▄█▀███ ██ ██▀  ▄█▀███ ██▄█▀█▄██▀ │ │
+│ ╭────────────────────────────╮ │▀█  ██▀█ ▄█ ██▀▀██ ██   ███ ██ ███ ██ ██   ██▀▀ ███ ██▀▀ ▀▀█▄│ │
+│ │ A Night at the Opera       │ │ ▀▀▀▀  █▀▀▀ ▀▀▀▀▀▀ ▀▀    █▀  ▀▀▀ ▀▀▀▀ ▀▀    ▀▀▀  █▀  ▀▀▀ ▀▀▀ │ │
+│ │ …fourth studio album       │ │       ▀                ▀▀                      ▀▀           │ │
+│ │ Queen                      │ │                                                             │ │
+│ │ …British rock band         │ │                    No escape from reality                   │ │
+│ ╰────────────────────────────╯ ╰─────────────────────────────────────────────────────────────╯ │
+│ ╭─ cava ─────────────────────────────────────────────────────────────────────────────────────╮ │
+│ │  ▂▄█▆▃ ▁▅█▇▄▂ ▃▆█▅▁ ▂▇█▄▃▁ ▅█▆▂ ▁▃▇█▅▂ ▄█▃▁ ▂▆█▇▄▃ ▁▄█▅▂ ▃▇█▆▂▄▃▁ ▅█▇▃▁ ▂▄▆█▅▃ ▁▇█▄▂       │ │
+│ ╰────────────────────────────────────────────────────────────────────────────────────────────╯ │
+│ 1:23 ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 5:55    │
+│ space Play/Pause  n Next  p Prev  ←/→ ±5s  s Player  k Karaoke  r Refresh  q Quit              │
+└────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 **What it does**
 
+- **The track title as a banner**, drawn as large as the terminal has room for and painted in the colours of the album cover that's playing.
 - **Album art** at full resolution on terminals that speak the Kitty graphics protocol, ANSI half-blocks everywhere else — sized to the artwork's real aspect ratio, redrawn on resize.
-- **Lyrics** from lrclib.net, synced line-by-line, matched by duration so they don't drift out of time on a remaster or single edit.
+- **Lyrics** from lrclib.net, matched by duration so they don't drift out of time on a remaster or single edit.
+- **A karaoke stage** when the track is synced: the line being sung is set in type as large as the panel allows and swept in colour as the singer reaches it, so you always know where you are in it.
 - **Playback controls** — play/pause, skip and seek, without leaving the terminal.
 - **A player picker** — click the title bar to choose which of your running players to follow.
 - **Trivia** on the album and artist from Wikipedia, in your language.
@@ -110,6 +117,7 @@ You don't need to switch back to your music player.
 | `n`     | Next track                    |
 | `p`     | Previous track                |
 | `→` `←` | Seek forward / back 5 seconds |
+| `k`     | Animation on / off (karaoke stage and title banner) |
 
 Commands go to the player being followed. One that doesn't implement a control
 just ignores it — browsers commonly refuse seeking.
@@ -154,11 +162,46 @@ legendary-lyrics --player spotify
 legendary-lyrics --list-players     # see what's registered
 ```
 
+### The title bar
+
+The title of what is playing is drawn as a banner: rasterised from one of your
+installed fonts and painted with half-blocks, so it carries accents and any
+script the font covers rather than a hand-drawn block alphabet's idea of the
+Latin letters.
+
+**It is anti-aliased.** A pixel only partly covered by a stroke is drawn as a
+blend of the ink and the panel behind it rather than being rounded to on or off,
+which is the difference between type and lego — the diagram above is plain text
+and cannot show it.
+
+**It is sized to the terminal.** The bar takes a share of the terminal's height,
+the largest type that fits that box is chosen, and one size up is allowed to
+overflow the width slightly and condensed back in — so the same title fills a
+100-column window and a fullscreen one. The banner is centred both ways, with
+the status, the artist and the player on a line of its own beneath it.
+
+When there is no room to draw it legibly — a short terminal, a narrow one, or a
+very long title — the bar falls back to the single line it has always been,
+which shows the title in full:
+
+```
+▶  The Ballad of the Extraordinarily Long Song Title, Pt. 2 — Radiohead   [auto · spotify ▾]
+```
+
+**It is painted in the album cover's colours.** The cover is quantised down to
+the handful of shades it is really made of, near-greys are thrown away, and what
+is left is ordered around the colour wheel so the gradient sweeps rather than
+lurches. A cover with only one colour in it gives a tonal ramp of that colour
+instead; one with no colour at all — a black-and-white sleeve — gives silver.
+Without artwork, the banner keeps the built-in gradient.
+
+The colours drift slowly, and `k` freezes them along with the karaoke stage.
+
 ### Lyrics
 
 Lyrics come from [lrclib.net](https://lrclib.net). When a synced (LRC) version
-exists, the current line is highlighted and moves with the song; otherwise the
-plain text is shown.
+exists you get the karaoke stage described below; otherwise the plain text is
+shown as a list.
 
 A popular song exists there in several cuts — single edit, remaster, live — and
 picking the wrong one makes synced lyrics drift further out of time the longer
@@ -168,6 +211,41 @@ lookup misses.
 
 If the words still don't line up, or the wrong song was matched, press `r`.
 That forgets what was cached for this track and fetches it again.
+
+### Singing along
+
+When the track comes with timestamps, the lyrics panel turns into a stage built
+for singing rather than reading.
+
+- **The line being sung sits in the middle**, set in type of its own — the same
+  rasterised-from-a-real-font trick as the title banner, anti-aliased into the
+  panel and several times the size of ordinary terminal text — with the lines
+  around it in plain text above and below, fading out by distance.
+- **It is swept left to right** in time with the music: what you have already
+  sung is coloured, what is still to come stays pale, and the cut runs over
+  pixels rather than characters, so it slices a letter in half the way a karaoke
+  wipe is supposed to. A cue only says when a line *starts*, so the sweep runs at
+  singing speed rather than being stretched across whatever instrumental follows.
+- **It is sized to the panel.** A line too wide to draw in one piece is split
+  over two or three rows, which usually means it can be drawn far bigger than it
+  could in one; every piece shares the winning size. A taller terminal also gets
+  more air between the surrounding lines. Where there is no room to rasterise at
+  all — a narrow panel, a short one, or no font to work from — the stage falls
+  back to ordinary text, centred and letter-spaced to fill the width.
+- **Each line materialises** as it takes the stage, with one of four effects in
+  the spirit of the desktop screensaver: expanding from the centre, sliding in,
+  decrypting, or settling from scattered order.
+- **The colours move.** The sweep is painted from a six-stop gradient that
+  drifts continuously, and the sung text brightens with the loudest band of the
+  visualizer, so it pulses with the music.
+- **A four-beat count-in** — `● ● ○ ○` — appears before the words come back
+  after an instrumental, and before the first line of the song.
+
+Press `k` to switch the animation off and get the plain list back — it freezes
+the title banner's colours too — or start with `--no-karaoke` to keep it off.
+
+The playback position is read once a second, so it is interpolated in between —
+the sweep and the progress bar move smoothly rather than in one-second jumps.
 
 ### Trivia
 
@@ -239,6 +317,7 @@ desktop theme. Everywhere else it uses Textual's palette.
 | `-p`, `--player`    | Follow a specific player instead of auto-selecting                     |
 | `-b`, `--bars N`    | Visualizer bar count (default 60)                                      |
 | `--lang CODE`       | Wikipedia edition for trivia, falling back to English (default: locale) |
+| `--no-karaoke`      | Show synced lyrics as a plain list instead of the animated stage       |
 | `--no-trivia`       | Hide the trivia panel; album art takes the whole column                |
 | `--no-cache`        | Never read or write the on-disk cache                                  |
 | `--clear-cache`     | Delete everything cached, then exit                                    |
@@ -262,6 +341,21 @@ it from the start.
 **The lyrics drift out of sync.**
 Press `r`. That drops the cached match and refetches, usually landing on a
 version with the right duration.
+
+**The lyrics are ordinary text, not the big type.**
+Same reasons as the title bar below: too narrow a panel, too short a one, or no
+font found. `--no-trivia` gives the lyrics panel more room; so does a bigger
+window.
+
+**The title is a plain line instead of a banner.**
+There was no room to draw it legibly: the terminal is too short, too narrow, or
+the title is very long. Make the window bigger, or `--no-trivia` to free up
+room. If it never appears at any size, the app found no font to rasterise it
+with — install `fontconfig` and a sans family such as DejaVu or Liberation.
+
+**The animated lyrics are distracting, or the terminal can't keep up.**
+Press `k`, or start with `--no-karaoke`. The plain list is exactly what earlier
+versions showed.
 
 **No lyrics at all.**
 The track may simply not be in lrclib.net's database. Nothing to be done except
@@ -288,6 +382,7 @@ biography, so an empty half usually means "no article", not a bug.
 |---------------|------------------------------------------------------------------------------------------------------|
 | Python        | 3.9+                                                                                                 |
 | Terminal      | Any true-color terminal; Kitty, Ghostty, foot and WezTerm additionally get full-resolution album art  |
+| Fonts         | Any TrueType sans on the system, found through `fontconfig`, for the title banner and the karaoke type; without one both fall back to ordinary terminal text |
 | Audio         | PulseAudio or PipeWire, for `cava`                                                                   |
 | MPRIS players | Spotify, Firefox, Chromium, VLC, MPD (+plugin), Rhythmbox, Clementine…                                |
 
