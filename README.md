@@ -1,8 +1,9 @@
 # Legendary Lyrics
 
-A terminal music visualizer: album art, lyrics that follow the song, Wikipedia
-background on what you're hearing, and playback controls — for whatever is
-already playing on your machine.
+A terminal music visualizer for whatever is already playing on your machine:
+album art, a karaoke stage that sets the line being sung in type large enough
+to sing from, Wikipedia background on what you're hearing, and playback
+controls.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -59,7 +60,10 @@ yay -S legendary-lyrics    # or: paru -S legendary-lyrics
 
 Then run `legendary-lyrics` from anywhere.
 
-`cava` is an optional dependency — install it for real audio bars:
+`fontconfig` comes in as a dependency — it's how the large type finds a font —
+and any TrueType font satisfies the rest, which on a desktop you already have.
+
+`cava` is an optional dependency; install it for real audio bars:
 
 ```bash
 sudo pacman -S cava
@@ -71,15 +75,19 @@ sudo pacman -S cava
 speaks MPRIS (Spotify, Firefox, Chromium, VLC, Rhythmbox, MPD with a plugin…)
 is picked up automatically.
 
+`fontconfig` and a TrueType font are wanted too — that's what the title banner
+and the karaoke type are set from. Without them the app runs fine, just in
+ordinary terminal text.
+
 ```bash
 # Arch Linux / Manjaro
-sudo pacman -S playerctl python
+sudo pacman -S playerctl python fontconfig ttf-dejavu
 
 # Ubuntu / Debian
-sudo apt install playerctl python3 python3-venv
+sudo apt install playerctl python3 python3-venv fontconfig fonts-dejavu-core
 
 # Fedora
-sudo dnf install playerctl python3
+sudo dnf install playerctl python3 fontconfig dejavu-sans-fonts
 ```
 
 Then:
@@ -128,10 +136,10 @@ just ignores it — browsers commonly refuse seeking.
 
 ### Choosing which player to follow
 
-The end of the title bar shows who's being followed:
+The line under the title banner shows who's being followed:
 
 ```
-▶  Bohemian Rhapsody — Queen   [auto · spotify ▾]
+▶  Queen   [auto · spotify ▾]
 ```
 
 `auto` means the app picked for you. When several players are registered it
@@ -174,11 +182,13 @@ blend of the ink and the panel behind it rather than being rounded to on or off,
 which is the difference between type and lego — the diagram above is plain text
 and cannot show it.
 
-**It is sized to the terminal.** The bar takes a share of the terminal's height,
-the largest type that fits that box is chosen, and one size up is allowed to
-overflow the width slightly and condensed back in — so the same title fills a
-100-column window and a fullscreen one. The banner is centred both ways, with
-the status, the artist and the player on a line of its own beneath it.
+**It is sized to the terminal.** How large the type may go is a share of the
+terminal's height; within that the largest size that fits is found, one size up
+is allowed to overflow the width a little and is condensed back in, and the
+result is then stepped back a fifth so the letters are not jammed against the
+edges of their box. The bar itself is only ever as tall as the letters need. The
+banner is centred, with the status, the artist and the player on a line of its
+own beneath it.
 
 When there is no room to draw it legibly — a short terminal, a narrow one, or a
 very long title — the bar falls back to the single line it has always been,
@@ -232,9 +242,10 @@ for singing rather than reading.
   more air between the surrounding lines. Where there is no room to rasterise at
   all — a narrow panel, a short one, or no font to work from — the stage falls
   back to ordinary text, centred and letter-spaced to fill the width.
-- **Each line materialises** as it takes the stage, with one of four effects in
-  the spirit of the desktop screensaver: expanding from the centre, sliding in,
-  decrypting, or settling from scattered order.
+- **Each line materialises** as it takes the stage, in the spirit of the desktop
+  screensaver's text effects: expanding from the centre, sliding in, or settling
+  out of scattered order. In the plain-text fallback a fourth scrambles the
+  characters until they land.
 - **The colours move.** The sweep is painted from a six-stop gradient that
   drifts continuously, and the sung text brightens with the loudest band of the
   visualizer, so it pulses with the music.
@@ -306,7 +317,8 @@ clearing the whole cache.
 ### Colors
 
 If you're on [Omarchy](https://omarchy.org), the app follows your active
-desktop theme. Everywhere else it uses Textual's palette.
+desktop theme. Everywhere else it uses Textual's palette. The title banner is
+the exception: it takes its colours from the album cover, as described above.
 
 ---
 
@@ -343,8 +355,8 @@ Press `r`. That drops the cached match and refetches, usually landing on a
 version with the right duration.
 
 **The lyrics are ordinary text, not the big type.**
-Same reasons as the title bar below: too narrow a panel, too short a one, or no
-font found. `--no-trivia` gives the lyrics panel more room; so does a bigger
+Same reasons as the next entry: too narrow a panel, too short a one, or no font
+found. `--no-trivia` gives the lyrics panel more room; so does a bigger
 window.
 
 **The title is a plain line instead of a banner.**
@@ -380,7 +392,7 @@ biography, so an empty half usually means "no article", not a bug.
 
 | Component     | Requirement                                                                                          |
 |---------------|------------------------------------------------------------------------------------------------------|
-| Python        | 3.9+                                                                                                 |
+| Python        | 3.10+ — current Pillow's floor; the app's own code still runs on 3.9                                  |
 | Terminal      | Any true-color terminal; Kitty, Ghostty, foot and WezTerm additionally get full-resolution album art  |
 | Fonts         | Any TrueType sans on the system, found through `fontconfig`, for the title banner and the karaoke type; without one both fall back to ordinary terminal text |
 | Audio         | PulseAudio or PipeWire, for `cava`                                                                   |
