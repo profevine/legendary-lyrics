@@ -24,7 +24,7 @@ from bisect import bisect_right
 from pathlib import Path
 from typing import Optional
 
-__version__ = '1.3.0'
+__version__ = '1.4.0'
 
 
 # ─── options ─────────────────────────────────────────────────────────────────
@@ -37,6 +37,8 @@ class Options:
     cache: bool = True      # read/write the on-disk cache
     karaoke: bool = True    # animate synced lyrics instead of listing them
     lang: str = 'en'        # Wikipedia language edition
+    mic: str = ''           # PipeWire source to monitor, '' = system default
+    hear_me: bool = False   # start with the mic monitor on
 
 
 OPTS = Options()
@@ -756,6 +758,105 @@ class Visualizer:
                 pass
         if self._cfg_path and self._cfg_path.exists():
             self._cfg_path.unlink()
+
+
+# ─── mic monitor ─────────────────────────────────────────────────────────────
+
+def list_mics() -> list[tuple[str, str]]:
+    """(name, description) of every capture source PipeWire knows, leaving out
+    the '.monitor' sources, which are speakers, not microphones."""
+    try:
+        out = subprocess.check_output(
+            ['pactl', '-f', 'json', 'list', 'sources'],
+            stderr=subprocess.DEVNULL, text=True, timeout=3,
+        )
+        sources = json.loads(out)
+    except (FileNotFoundError, subprocess.SubprocessError, ValueError):
+        return []
+    return [
+        (s['name'], s.get('description') or s['name'])
+        for s in sources
+        if not s['name'].endswith('.monitor')
+    ]
+
+
+def default_mic() -> str:
+    try:
+        return subprocess.check_output(
+            ['pactl', 'get-default-source'],
+            stderr=subprocess.DEVNULL, text=True, timeout=3,
+        ).strip()
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return ''
+
+
+class MicMonitor:
+    """Plays a microphone straight into the default output, so you can hear
+    yourself sing over the track on headphones.
+
+    The audio never leaves PipeWire: pw-loopback links the source to the sink
+    and asks for a 128-frame quantum, about 2.7 ms at 48 kHz, which is well
+    under the ~10 ms where your own voice starts to sound like an echo. Asking
+    for a smaller quantum gains nothing you can hear and starts to crackle.
+    The stream shows up in the system mixer under its media name, so its
+    volume is set there like any other app's."""
+
+    QUANTUM = '128/48000'
+    MEDIA_NAME = 'Legendary Lyrics mic monitor'
+
+    def __init__(self, source: str = ''):
+        self.source = source        # PipeWire source name; '' = system default
+        self._proc: Optional[asyncio.subprocess.Process] = None
+
+    @property
+    def on(self) -> bool:
+        return self._proc is not None and self._proc.returncode is None
+
+    async def start(self) -> Optional[str]:
+        """Start monitoring; returns why it could not, or None on success."""
+        if self.on:
+            return None
+        cmd = [
+            'pw-loopback', '-n', 'legendary-lyrics-mic', '-l', '3',
+            '--capture-props',
+            f'node.latency={self.QUANTUM} node.description="{self.MEDIA_NAME}"',
+            '--playback-props',
+            f'node.latency={self.QUANTUM} media.name="{self.MEDIA_NAME}" '
+            f'node.description="{self.MEDIA_NAME}"',
+        ]
+        if self.source:
+            cmd[1:1] = ['-C', self.source]
+        try:
+            self._proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            return 'pw-loopback not found (install pipewire)'
+        except OSError as exc:
+            return f'pw-loopback failed to start: {exc}'
+        # A bad source name or no PipeWire makes it exit right away.
+        try:
+            await asyncio.wait_for(self._proc.wait(), 0.4)
+        except asyncio.TimeoutError:
+            return None
+        self._proc = None
+        return 'pw-loopback exited — is PipeWire running?'
+
+    async def stop(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is None or proc.returncode is not None:
+            return
+        try:
+            proc.terminate()
+            await asyncio.wait_for(proc.wait(), 2)
+        except (ProcessLookupError, asyncio.TimeoutError):
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
 
 
 # ─── OS theme ─────────────────────────────────────────────────────────────────
@@ -2069,6 +2170,8 @@ class LegendaryLyricsApp(App):
         ('right', 'seek_forward', '+5s'),
         ('s', 'choose_player', 'Player'),
         ('k', 'toggle_karaoke', 'Karaoke'),
+        ('m', 'toggle_mic', 'Hear me'),
+        ('M', 'next_mic', 'Mic'),
         ('r', 'refresh', 'Refresh'),
         ('q', 'quit', 'Quit'),
     ]
@@ -2081,6 +2184,7 @@ class LegendaryLyricsApp(App):
         # so they move smoothly between polls instead of jumping.
         self._pos_at: float = time.monotonic()
         self._viz = Visualizer(n_bars=OPTS.bars)
+        self._mic = MicMonitor(OPTS.mic)
 
     def compose(self) -> ComposeResult:
         yield InfoBar(id='info')
@@ -2100,6 +2204,8 @@ class LegendaryLyricsApp(App):
             self.register_theme(os_theme)
             self.theme = 'omarchy'
         await self._viz.start()
+        if OPTS.hear_me:
+            await self.action_toggle_mic()
         self.set_interval(1.0, self._poll)
         self.set_interval(0.25, self._update_progress)
         self.set_interval(1 / 20, self._tick)
@@ -2237,6 +2343,7 @@ class LegendaryLyricsApp(App):
             info.tick()
 
     async def on_unmount(self):
+        await self._mic.stop()
         await self._viz.stop()
         if _kitty_supported():
             # Otherwise the album art stays on the terminal after we exit.
@@ -2318,6 +2425,46 @@ class LegendaryLyricsApp(App):
             if widget is not None:
                 widget.relayout()
 
+    def _mic_label(self) -> str:
+        name = self._mic.source or default_mic()
+        for source, description in list_mics():
+            if source == name:
+                return description
+        return name or 'default microphone'
+
+    async def action_toggle_mic(self) -> None:
+        if self._mic.on:
+            await self._mic.stop()
+            self.notify('Mic monitor off')
+            return
+        error = await self._mic.start()
+        if error:
+            self.notify(error, title='Mic monitor', severity='error')
+            return
+        label = await asyncio.to_thread(self._mic_label)
+        self.notify(f'Hearing {label} — use headphones, or the speakers '
+                    'will feed back', title='Mic monitor on')
+
+    async def action_next_mic(self) -> None:
+        mics = await asyncio.to_thread(list_mics)
+        if not mics:
+            self.notify('No microphones found', severity='warning')
+            return
+        names = [name for name, _ in mics]
+        current = self._mic.source or await asyncio.to_thread(default_mic)
+        index = names.index(current) + 1 if current in names else 0
+        name, description = mics[index % len(mics)]
+        self._mic.source = name
+        if self._mic.on:
+            # Relink to the new source; the gap is a fraction of a second.
+            await self._mic.stop()
+            error = await self._mic.start()
+            if error:
+                self.notify(error, title='Mic monitor', severity='error')
+                return
+        self.notify(description, title='Mic' + (' (monitoring)'
+                                                 if self._mic.on else ''))
+
     async def action_refresh(self):
         # A refresh should really refetch, so drop what we cached for this
         # track first — otherwise 'r' just replays the same wrong match.
@@ -2367,6 +2514,20 @@ def main() -> int:
              'sing-along stage',
     )
     parser.add_argument(
+        '--hear-me', action='store_true',
+        help='start with the mic monitor on, playing your microphone into '
+             'your headphones so you hear yourself sing (toggle with m)',
+    )
+    parser.add_argument(
+        '--mic', default='', metavar='SOURCE',
+        help='PipeWire source to monitor instead of the default microphone '
+             '(see --list-mics; cycle in the app with M)',
+    )
+    parser.add_argument(
+        '--list-mics', action='store_true',
+        help='list the microphones the mic monitor can use, then exit',
+    )
+    parser.add_argument(
         '--no-cache', action='store_true',
         help='never read or write the on-disk cache',
     )
@@ -2394,6 +2555,19 @@ def main() -> int:
     OPTS.cache = not args.no_cache
     OPTS.karaoke = not args.no_karaoke
     OPTS.lang = args.lang
+    OPTS.mic = args.mic
+    OPTS.hear_me = args.hear_me
+
+    if args.list_mics:
+        mics = list_mics()
+        if not mics:
+            print('No microphones found (is PipeWire running?).')
+            return 1
+        default = default_mic()
+        for name, description in mics:
+            mark = '*' if name == default else ' '
+            print(f'{mark} {name}\n    {description}')
+        return 0
 
     if args.list_players:
         players = _players_snapshot()

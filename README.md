@@ -126,6 +126,8 @@ You don't need to switch back to your music player.
 | `p`     | Previous track                |
 | `→` `←` | Seek forward / back 5 seconds |
 | `k`     | Animation on / off (karaoke stage and title banner) |
+| `m`     | Hear yourself: mic monitor on / off |
+| `M`     | Switch which microphone is monitored |
 
 Commands go to the player being followed. One that doesn't implement a control
 just ignores it — browsers commonly refuse seeking.
@@ -258,6 +260,23 @@ the title banner's colours too — or start with `--no-karaoke` to keep it off.
 The playback position is read once a second, so it is interpolated in between —
 the sweep and the progress bar move smoothly rather than in one-second jumps.
 
+#### Hearing yourself
+
+Press `m` to hear your own voice in your headphones while you sing — your
+webcam's microphone, a headset mic, or any other input PipeWire sees. `M`
+steps through the microphones (the one in use is named in a notification), and
+`--hear-me` starts with the monitor already on; `--list-mics` shows what there
+is, and `--mic SOURCE` picks one from the start.
+
+The voice goes straight from the microphone to your output inside PipeWire,
+through `pw-loopback` with a 128-frame quantum — about 3 ms at 48 kHz — so it
+lands in time with your mouth rather than as an echo. Its volume is set in the
+system mixer, where it appears as *Legendary Lyrics mic monitor*. Use
+headphones: through speakers the microphone hears itself and howls.
+
+USB microphones and webcams add a few milliseconds of their own buffering on
+top, which is still well short of what you can hear as a delay.
+
 ### Trivia
 
 Below the album art is background on the album and the artist, pulled from
@@ -331,6 +350,9 @@ the exception: it takes its colours from the album cover, as described above.
 | `--lang CODE`       | Wikipedia edition for trivia, falling back to English (default: locale) |
 | `--no-karaoke`      | Show synced lyrics as a plain list instead of the animated stage       |
 | `--no-trivia`       | Hide the trivia panel; album art takes the whole column                |
+| `--hear-me`         | Start with the mic monitor on (`m` toggles it)                         |
+| `--mic SOURCE`      | Microphone to monitor instead of the system default                    |
+| `--list-mics`       | Print the microphones the monitor can use, then exit                   |
 | `--no-cache`        | Never read or write the on-disk cache                                  |
 | `--clear-cache`     | Delete everything cached, then exit                                    |
 | `--list-players`    | Print the registered MPRIS players, then exit                          |
